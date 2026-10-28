@@ -41,5 +41,7 @@ llvm_configure.configure(
         "AMDGPU",
         "Hexagon",
         "NVPTX",
+        # Mojo -> Vulkan SPIR-V prototype (Adreno 710).
+        "SPIRV",
     ],
 )
