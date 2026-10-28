@@ -11,9 +11,10 @@ presentation, with speaker notes, is also
 
 ## Results
 
-Measured on a moto g stylus 5G (2024), Adreno 710, Mesa Turnip (Vulkan 1.4),
-before codegen started structuring the control flow with StructurizeCFG
-(the kernels still pass `spirv-val`; a rerun on the phone is pending):
+Measured on a moto g stylus 5G (2024), Adreno 710, Mesa Turnip (Vulkan 1.4).
+A rerun after codegen started structuring the control flow with StructurizeCFG
+(2026-10-28) gave the same picture: all eight kernels pass, at or below the
+retargeter's times, and Llama 48 of 48 tokens at 281.0 ms a token.
 
 - Eight test kernels (vector add, vec4, warp sum, block sum, four SGEMMs) pass
   a full output check, as fast as or faster than the earlier route that
