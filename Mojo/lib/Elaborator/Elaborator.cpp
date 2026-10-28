@@ -122,6 +122,10 @@ ImplNode::ImplNode(ParamNode *parent)
 }
 
 void ImplNode::setToError(ErrorTree &&err) {
+  // Local change (SPIR-V prototype): a second error on a node keeps the first
+  // and goes on, so it is reported instead of aborting the process.
+  if (error)
+    return;
   if (error) {
 #ifndef MODULAR_PRODUCTION
     std::lock_guard<std::mutex> guard(getGlobalMutex());
