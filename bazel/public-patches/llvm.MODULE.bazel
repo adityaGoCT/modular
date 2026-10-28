@@ -35,6 +35,11 @@ llvm_source.configure(
         # branch after it. Otherwise an OpSelectionMerge can precede an
         # OpBranch, which spirv-val rejects (Mojo -> Vulkan SPIR-V prototype).
         "//bazel/public-patches:llvm-spirv-structurizer-split-headers.patch",
+        # SPIR-V cooperative matrices (SPV_KHR_cooperative_matrix) for Vulkan:
+        # shaders may use the __spirv_* builtins, which name core instructions
+        # but are recorded with the OpenCL instruction set, and Vulkan triples
+        # have the extension available.
+        "//bazel/public-patches:llvm-spirv-cooperative-matrix-vulkan.patch",
     ],
 )
 

@@ -1,0 +1,35 @@
+diff --git a/llvm/lib/Target/SPIRV/SPIRVBuiltins.cpp b/llvm/lib/Target/SPIRV/SPIRVBuiltins.cpp
+--- a/llvm/lib/Target/SPIRV/SPIRVBuiltins.cpp
++++ b/llvm/lib/Target/SPIRV/SPIRVBuiltins.cpp
+@@ -349,6 +349,14 @@
+       return std::make_unique<SPIRV::IncomingCall>(
+           BuiltinName, Builtin, ReturnRegister, ReturnType, Arguments);
+   }
++
++  // The __spirv_* builtins name core SPIR-V instructions, not instructions of
++  // an extended set. They are recorded with OpenCL_std, but shaders can use
++  // them too (cooperative matrices, for example).
++  if (Set != SPIRV::InstructionSet::OpenCL_std &&
++      StringRef(BuiltinName).starts_with("__spirv_"))
++    return lookupBuiltin(DemangledCall, SPIRV::InstructionSet::OpenCL_std,
++                         ReturnRegister, ReturnType, Arguments);
+ 
+   // No builtin with such name was found in the set.
+   return nullptr;
+diff --git a/llvm/lib/Target/SPIRV/SPIRVSubtarget.cpp b/llvm/lib/Target/SPIRV/SPIRVSubtarget.cpp
+--- a/llvm/lib/Target/SPIRV/SPIRVSubtarget.cpp
++++ b/llvm/lib/Target/SPIRV/SPIRVSubtarget.cpp
+@@ -105,6 +105,13 @@
+   }
+   if (TargetTriple.getVendor() == Triple::AMD)
+     Extensions = SPIRVExtensionsParser::getValidExtensions(TargetTriple);
++  // Vulkan: cooperative matrices, and the Vulkan memory model they require,
++  // are available; a module gets each extension only when it uses it (the
++  // __spirv_CooperativeMatrix* builtins; spirv.MemoryModel metadata).
++  if (TargetTriple.getOS() == Triple::Vulkan) {
++    Extensions.insert(SPIRV::Extension::SPV_KHR_cooperative_matrix);
++    Extensions.insert(SPIRV::Extension::SPV_KHR_vulkan_memory_model);
++  }
+ 
+   // The order of initialization is important.
+   initAvailableExtensions(Extensions);
