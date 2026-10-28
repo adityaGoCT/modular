@@ -29,6 +29,12 @@ llvm_source.configure(
         # vanishes from the report. The MLIR counterpart of the --llvm-timing
         # fix in llvm/llvm-project#218492.
         "//bazel/public-patches:llvm-mlir-timing-recycled-key.patch",
+        # SPIR-V structurizer: when a block with three or more merge
+        # instructions is split, check the previous merge instruction (not
+        # always the first) for a selection merge, which needs a conditional
+        # branch after it. Otherwise an OpSelectionMerge can precede an
+        # OpBranch, which spirv-val rejects (Mojo -> Vulkan SPIR-V prototype).
+        "//bazel/public-patches:llvm-spirv-structurizer-split-headers.patch",
     ],
 )
 

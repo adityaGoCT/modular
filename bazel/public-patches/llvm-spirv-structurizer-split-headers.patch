@@ -1,0 +1,14 @@
+diff --git a/llvm/lib/Target/SPIRV/SPIRVStructurizer.cpp b/llvm/lib/Target/SPIRV/SPIRVStructurizer.cpp
+--- a/llvm/lib/Target/SPIRV/SPIRVStructurizer.cpp
++++ b/llvm/lib/Target/SPIRV/SPIRVStructurizer.cpp
+@@ -610,7 +610,9 @@
+         BasicBlock *NewBlock =
+             Header->splitBasicBlock(MergeInstructions[i], "new.header");
+ 
+-        if (getDesignatedContinueBlock(MergeInstructions[0]) == nullptr) {
++        // The block keeping the previous merge instruction must end in a
++        // conditional branch if that instruction is an OpSelectionMerge.
++        if (getDesignatedContinueBlock(MergeInstructions[i - 1]) == nullptr) {
+           BasicBlock *Unreachable = CreateUnreachable(F);
+ 
+           Instruction *Term = Header->getTerminator();
