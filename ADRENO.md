@@ -41,7 +41,9 @@ its HAL device layer), and a driver plugin (`M_driver_*`, in mojo-adreno's
 `remote/`) forwards allocations, copies and kernel launches over `adb forward`
 to a small Vulkan executor on the phone. All 25 test graphs run this way and
 match NumPy or MAX on the Mac's CPU, ResNet-18 included (max error 5.7e-5,
-14 s, most of it one network round trip per launch):
+8.3 s per image once its weights are on the phone; the plugin streams requests
+and the phone pipelines the GPU work, so that is GPU time, mostly MAX's naive
+conv2d, which runs one thread per output pixel across all output channels):
 
 ```bash
 BAZELISK_SKIP_WRAPPER=true ./bazelw build --config=disable-lint \

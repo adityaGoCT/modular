@@ -107,19 +107,26 @@ def build(name, shapes, fn, device):
     return g
 
 
-def execute(session, device, graph, inputs):
-    """Runs `graph` on `device`; returns the output and the run's seconds (inputs
-    in, execute, output back; not compiling)."""
+REPEAT = next((int(a.split("=")[1]) for a in sys.argv if a.startswith("--repeat=")), 1)
+
+
+def execute(session, device, graph, inputs, repeat=1):
+    """Runs `graph` on `device` `repeat` times; returns the last output and each
+    run's seconds (inputs in, execute, output back; not compiling)."""
     model = session.load(graph)
-    t = time.time()
-    out = model.execute(*[driver.Buffer.from_numpy(x).to(device) for x in inputs])[0]
-    return out.to(driver.CPU()).to_numpy(), time.time() - t
+    times = []
+    for _ in range(repeat):
+        t = time.time()
+        out = model.execute(*[driver.Buffer.from_numpy(x).to(device) for x in inputs])[0]
+        result = out.to(driver.CPU()).to_numpy()
+        times.append(time.time() - t)
+    return result, times
 
 
 def run(sessions, name, shapes, fn, reference, tol):
     (gpu_session, gpu), (cpu_session, cpu) = sessions
     inputs = [rng.standard_normal(s).astype(np.float32) for s in shapes]
-    got, seconds = execute(gpu_session, gpu, build(name, shapes, fn, GPU), inputs)
+    got, seconds = execute(gpu_session, gpu, build(name, shapes, fn, GPU), inputs, REPEAT)
     if reference is not None:
         want = np.asarray(reference(*inputs))
     else:
@@ -145,7 +152,8 @@ def main():
         try:
             ok, err, seconds = run(sessions, name, shapes, fn, reference, tol)
             ref = "NumPy" if reference is not None else "MAX on CPU"
-            print(f"{name:20s} {'PASS' if ok else 'FAIL'}  max error {err:.2e} (vs {ref})  {seconds:.2f} s",
+            runs = " ".join(f"{t:.2f}" for t in seconds)
+            print(f"{name:20s} {'PASS' if ok else 'FAIL'}  max error {err:.2e} (vs {ref})  {runs} s",
                   flush=True)
             passed += ok
         except Exception as e:  # report and go on
