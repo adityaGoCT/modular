@@ -41,6 +41,7 @@ struct SpirvTargets(TargetAcceleratorCollection):
     comptime RAW_TARGETS = TypeList.of[
         Trait=TargetAcceleratorType,
         Adreno710._with_cli_values[["adreno710"]],
+        Adreno840._with_cli_values[["adreno840"]],
     ]().values
     # fmt: on
 
@@ -97,3 +98,37 @@ comptime Adreno710 = TargetAccelerator[
     _adreno710_target,
 ]()
 """Qualcomm Adreno 710 GPU configuration."""
+
+
+comptime _adreno840_target = CompilationTarget[
+    _mlir_value=__mlir_attr[
+        `#kgen.target<triple = "spirv1.6-unknown-vulkan1.3-compute", `,
+        `stdlib_plugin = "spirv", `,
+        `opaque_plugin = `,
+        SPIRV_PLUGINS,
+        `,`,
+        `arch = "adreno840", `,
+        `features = "", `,
+        `data_layout = "e-i64:64-n8:16:32:64-G10", `,
+        `simd_bit_width = 128`,
+        `> : !kgen.target`,
+    ]
+]()
+"""Target configuration for an Adreno 8xx with `VK_KHR_cooperative_matrix`
+through Vulkan 1.3 (SPIR-V 1.6). The SPIR-V is the same as for the Adreno 710;
+the arch lets kernels use cooperative matrices (`max.gpu.compute.arch.mma_spirv`)."""
+
+comptime Adreno840 = TargetAccelerator[
+    GPUInfo.from_family(
+        family=AdrenoA7Family,
+        name="Adreno 840",
+        api="vulkan",
+        arch_name="adreno840",
+        compute=1.3,  # Vulkan version
+        version="vulkan_1_3",
+        sm_count=2,
+    ),
+    _adreno840_target,
+]()
+"""Qualcomm Adreno 840 GPU configuration (cooperative matrices). Its occupancy
+figures are the Adreno 7xx ones; only the arch matters to kernels so far."""
