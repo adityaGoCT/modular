@@ -99,6 +99,10 @@ def _resolve_max_threads_per_block_metadata() -> __mlir_type.`!kgen.string`:
     elif is_apple_gpu():
         # That attribute is used to represent Metal's [[max_total_threads_per_threadgroup(x)]]
         return "pop.air.max_work_group_size".value
+    elif current_accelerator().is_triple["spirv1.6-unknown-vulkan1.3-compute"]():
+        # Vulkan fixes the workgroup size in the shader (LocalSize); the SPIR-V
+        # backend takes it from this attribute.
+        return "pop.spirv.max_work_group_size".value
     else:
         CompilationTarget.unsupported_target_error[
             operation="MAX_THREADS_PER_BLOCK_METADATA",

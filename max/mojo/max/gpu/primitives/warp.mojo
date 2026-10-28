@@ -803,6 +803,10 @@ def lane_group_sum[
     def _reduce_add(x: SIMD, y: type_of(x)) -> type_of(x):
         return x + y
 
+    comptime if (
+        CurrentMaxPlugin.has_warp_sum and num_lanes == WARP_SIZE and stride == 1
+    ):
+        return CurrentMaxPlugin.warp_sum_fn(val)
     return _lane_group_broadcast_reduce[num_lanes=num_lanes, stride=stride](
         val, _reduce_add
     )

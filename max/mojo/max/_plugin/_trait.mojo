@@ -264,6 +264,35 @@ trait MaxPluginHooks:
             mask, val, src_lane.lt(UInt32(WARP_SIZE)).select(src_lane, lane)
         )
 
+    comptime has_warp_sum: Bool = False
+    """Whether `warp_sum_fn` lowers a whole-warp sum.
+
+    `warp.sum` and `lane_group_sum` over the whole warp use it when set, in
+    place of a butterfly of `shuffle_xor_fn` steps. A target whose hardware
+    reduces across a warp in one instruction, but whose shuffles are slow or
+    don't reconverge, sets it.
+    """
+
+    @inline(.always)
+    @staticmethod
+    def warp_sum_fn[
+        dtype: DType, simd_width: SIMDLength, //
+    ](val: SIMD[dtype, simd_width]) -> SIMD[dtype, simd_width]:
+        """Lowers a sum of `val` over all lanes of the warp, returned to every
+        lane. Only called when `has_warp_sum` is set.
+
+        Parameters:
+            dtype: The element type of the value.
+            simd_width: The vector width of the value.
+
+        Args:
+            val: The value each lane contributes.
+
+        Returns:
+            The elementwise sum over the warp's lanes.
+        """
+        CompilationTarget.unsupported_target_error[operation="warp_sum"]()
+
     @staticmethod
     def vote_fn[ret_type: DType](val: Bool) -> Scalar[ret_type]:
         """Lowers `vote()`, which returns the mask of warp lanes that voted
