@@ -33,15 +33,25 @@ namespace M::KGEN {
 /// Mojo kernels take raw pointers and scalars; a Vulkan shader takes no
 /// arguments and reaches memory through descriptor-bound storage buffers with
 /// logical addressing (no pointer arithmetic). So:
+///  - calls are inlined, and a trap (a failed `debug_assert`) ends the
+///    invocation,
 ///  - the arguments are flattened in order, aggregates (such as tensors,
-///    passed by value) field by field: the k-th pointer becomes the storage
-///    buffer at (set 0, binding k), and the j-th scalar becomes 64-bit slot j
-///    of a params storage buffer at the binding after the last pointer,
+///    passed by value, or in memory as `byval` when too large) field by field:
+///    the k-th pointer becomes the storage buffer at (set 0, binding k), and
+///    the j-th scalar becomes 64-bit slot j of a params storage buffer at the
+///    binding after the last pointer,
 ///  - every address into a buffer or a shared (Workgroup) array is tracked as
 ///    (buffer, element index) through its GEP chain and rebuilt at each load,
-///    store and atomic as `llvm.spv.resource.getpointer` or a typed GEP,
+///    store and atomic as `llvm.spv.resource.getpointer` or a typed GEP; a
+///    pointer that a phi or select takes from several buffers also carries a
+///    selector, and each access through it branches on the selector,
+///  - an access of another type than the memory's elements (a struct, a
+///    narrower or wider scalar) reads or writes whole elements and shifts the
+///    pieces; `ptrtoint` gives each buffer its own aligned base,
 ///  - `llvm.spv.workgroup.size` folds to the workgroup size, which Vulkan fixes
-///    in the shader: `MOJO_SPIRV_LOCAL_SIZE` ("x[,y[,z]]"), 64 by default.
+///    in the shader: `MOJO_SPIRV_LOCAL_SIZE` ("x[,y[,z]]"), 64 by default,
+///  - multiply-high is expanded, and vectors wider than four elements, which
+///    Vulkan cannot hold, are scalarized.
 ErrorOrSuccess lowerSPIRVKernelsToVulkan(llvm::Module &module);
 
 } // namespace M::KGEN

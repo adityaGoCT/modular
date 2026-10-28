@@ -28,6 +28,7 @@
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/Diagnostics.h"
+#include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallVector.h"
 #include <string>
 #include <utility>
@@ -48,7 +49,26 @@ public:
   // passed by value rather than in memory: logical SPIR-V cannot load a
   // pointer from memory, while SPIRVBackend can give each pointer field of a
   // by-value aggregate its own storage buffer. (No override of
-  // `lowerKernelArgToMemory`, unlike the other GPU targets.)
+  // `lowerKernelArgToMemory`, unlike the other GPU targets.) An aggregate too
+  // large to pass in registers stays in memory, marked `byval` with its type,
+  // and SPIRVBackend flattens it the same way.
+
+  bool isExportedKernel(mlir::Operation *func) const override {
+    mlir::ArrayAttr passthrough =
+        mlir::cast<mlir::LLVM::LLVMFuncOp>(func).getPassthroughAttr();
+    return passthrough &&
+           llvm::any_of(passthrough, [](mlir::Attribute attr) {
+             auto pair = mlir::dyn_cast<mlir::ArrayAttr>(attr);
+             auto name = pair && pair.size() == 2
+                             ? mlir::dyn_cast<mlir::StringAttr>(pair[0])
+                             : nullptr;
+             return name && name.getValue() == kSPIRVKernelAttr;
+           });
+  }
+
+  llvm::StringRef getKernelByValArgAttrName() const override {
+    return mlir::LLVM::LLVMDialect::getByValAttrName();
+  }
 
   bool needsVerification() const override { return true; }
 

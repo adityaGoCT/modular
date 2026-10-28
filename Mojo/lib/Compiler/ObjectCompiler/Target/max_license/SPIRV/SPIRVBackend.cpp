@@ -21,15 +21,19 @@
 #include "Target/Host/HostBackend.h"
 #include "Target/max_license/SPIRV/SPIRVTraits.h"
 #include "Target/max_license/SPIRV/VulkanKernelABI.h"
+#include "llvm/ADT/STLFunctionalExtras.h"
+#include "llvm/ADT/StringExtras.h"
 #include "llvm/IR/Function.h"
 #include "llvm/IR/Module.h"
 #include "llvm/Support/CodeGen.h"
+#include "llvm/Support/FileSystem.h"
 #include "llvm/Support/Process.h"
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/Target/TargetMachine.h"
 #include <algorithm>
 #include <atomic>
 #include <optional>
+#include <string>
 
 namespace M::KGEN {
 namespace {
@@ -96,29 +100,53 @@ public:
   bool isBaseTarget() const override { return false; }
 
 private:
+  /// Debugging aid: the path `env` names for this module's `ext` file. A
+  /// directory gets one file per module, named after its kernel.
+  static std::optional<std::string> debugPath(const char *env, unsigned id,
+                                              llvm::StringRef kernel,
+                                              llvm::StringRef ext) {
+    std::optional<std::string> path = llvm::sys::Process::GetEnv(env);
+    if (!path || !llvm::sys::fs::is_directory(*path))
+      return path;
+    std::string name = kernel.take_front(80).str();
+    std::replace_if(
+        name.begin(), name.end(),
+        [](char c) { return !llvm::isAlnum(c) && c != '_' && c != '.'; }, '_');
+    return (llvm::Twine(*path) + "/" + llvm::Twine(id) + "-" + name + ext)
+        .str();
+  }
+
+  static void writeDebugFile(std::optional<std::string> path,
+                             llvm::function_ref<void(llvm::raw_ostream &)> fn) {
+    if (!path)
+      return;
+    std::error_code ec;
+    llvm::raw_fd_ostream os(*path, ec);
+    if (!ec)
+      fn(os);
+  }
+
   ErrorOr<BufferRef> emitSPIRV(llvm::Module &module, EmitContext &ctx) const {
     // The KGEN target's layout omits "ve" (vectors aligned like their
     // elements, as Vulkan lays them out), which KGEN cannot parse; codegen
     // gets the SPIR-V target machine's exact layout.
     module.setDataLayout(ctx.tm.createDataLayout());
-    // Debugging aid: the optimized kernel IR before the Vulkan rewrite.
-    if (std::optional<std::string> path =
-            llvm::sys::Process::GetEnv("MOJO_SPIRV_DUMP_IN")) {
-      std::error_code ec;
-      llvm::raw_fd_ostream os(*path, ec);
-      if (!ec)
-        module.print(os, nullptr);
-    }
+    static std::atomic<unsigned> counter{0};
+    unsigned id = counter++;
+    std::string kernel;
+    for (llvm::Function &fn : module)
+      if (!fn.isDeclaration() && fn.hasFnAttribute("mojo.spirv.kernel")) {
+        kernel = fn.getName().str();
+        break;
+      }
+    // Debugging aids: the optimized kernel IR before the Vulkan rewrite, and
+    // the IR that LLVM's SPIR-V codegen receives.
+    writeDebugFile(debugPath("MOJO_SPIRV_DUMP_IN", id, kernel, ".in.ll"),
+                   [&](llvm::raw_ostream &os) { module.print(os, nullptr); });
     if (ErrorOrSuccess err = lowerSPIRVKernelsToVulkan(module))
       return err.takeError();
-    // Debugging aid: the IR that LLVM's SPIR-V codegen receives.
-    if (std::optional<std::string> path =
-            llvm::sys::Process::GetEnv("MOJO_SPIRV_DUMP")) {
-      std::error_code ec;
-      llvm::raw_fd_ostream os(*path, ec);
-      if (!ec)
-        module.print(os, nullptr);
-    }
+    writeDebugFile(debugPath("MOJO_SPIRV_DUMP", id, kernel, ".ll"),
+                   [&](llvm::raw_ostream &os) { module.print(os, nullptr); });
     // The IR is already optimized; codegen only translates it, and the Vulkan
     // driver compiles the SPIR-V again for the GPU. Optimizing codegen
     // (LLVM 24) breaks two Vulkan rules: loop strength reduction turns buffer
@@ -134,18 +162,10 @@ private:
     }
     // Debugging aid: keep every SPIR-V module, e.g. to run spirv-val on the
     // kernels of a MAX graph, which never reach the file system otherwise.
-    if (std::optional<std::string> dir =
-            llvm::sys::Process::GetEnv("MOJO_SPIRV_SAVE_DIR")) {
-      static std::atomic<unsigned> counter{0};
-      std::string path = (Twine(*dir) + "/" + Twine(counter++) + "-" +
-                          module.getModuleIdentifier() + ".spv")
-                             .str();
-      std::replace(path.begin() + dir->size() + 1, path.end(), '/', '_');
-      std::error_code ec;
-      llvm::raw_fd_ostream os(path, ec);
-      if (!ec)
-        os.write(buf->getBufferStart(), buf->getBufferSize());
-    }
+    writeDebugFile(debugPath("MOJO_SPIRV_SAVE_DIR", id, kernel, ".spv"),
+                   [&](llvm::raw_ostream &os) {
+                     os.write(buf->getBufferStart(), buf->getBufferSize());
+                   });
     return buf;
   }
 };
