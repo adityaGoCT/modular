@@ -868,6 +868,18 @@ def _matmul_gpu_impl[
         sep="",
     )
 
+    # Adreno 7xx through Vulkan SPIR-V has no matrix units, so it takes the
+    # SIMT kernel; the shape-based paths below assume tensor or matrix cores.
+    # Adreno 8xx, with KHR cooperative matrices, would branch here too.
+    comptime if ctx.target.is_triple["spirv1.6-unknown-vulkan1.3-compute"]():
+        logger.info("Executing: Naive MATMUL kernel (Adreno, no matrix units)")
+        enqueue_matmul_kernel_naive[
+            transpose_b=transpose_b,
+            has_epilogue_fn=has_epilogue_fn,
+            has_compute_fn=has_compute_fn,
+        ](c, a, b, epilogue_fn, compute_fn, ctx)
+        return
+
     comptime matmul_supported_format_nvidia = (
         a_type in (DType.float32, DType.bfloat16)
         and b_type in (DType.float32, DType.bfloat16)
