@@ -292,7 +292,10 @@ const std::string &Device::getAcceleratorArchOrEmpty() {
       return std::string();
     llvm::StringRef name(nameOr.takeValue());
 
-    llvm::StringRef api = dev->api();
+    // The plugin's concrete API: one without a `Device::API` constant (such
+    // as "vulkan") still names a Mojo vendor.
+    std::string api =
+        canonicalDeviceAPI(llvm::StringRef(dev->pluginAPI()).lower()).str();
     if (!hasMojoVendor(api))
       return std::string();
 

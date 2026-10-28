@@ -52,7 +52,9 @@ inline StringRef apiToVendorPrefix(StringRef api) {
 
 /// Whether `apiToVendorPrefix(api)` names a Mojo `--target-accelerator` vendor.
 inline bool hasMojoVendor(StringRef api) {
-  return api == "cuda" || api == "hip" || api == "metal";
+  // "vulkan": Mojo's Vulkan SPIR-V target ("vulkan:adreno710"), reached
+  // through a driver plugin.
+  return api == "cuda" || api == "hip" || api == "metal" || api == "vulkan";
 }
 
 /// The device API name for `api`, which may already be one or may be the Mojo

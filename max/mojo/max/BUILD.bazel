@@ -13,7 +13,13 @@ filegroup(
 
 mojo_library(
     name = "max",
-    srcs = [":max_srcs"],
+    # With --//:hal_device_context=true, the HAL overlay, so that MAX's kernel
+    # packages build against the DeviceContext the runtime provides (the
+    # `//max:max_mojo` alias that does this internally is not in this tree).
+    srcs = select({
+        "//:hal_device_context_enabled": ["//max/mojo/max/_driver/max_license:max_srcs_hal"],
+        "//conditions:default": [":max_srcs"],
+    }),
     docs_base_path = "mojo",
     deps = [
         "//MLRT:Driver/DeviceContext",

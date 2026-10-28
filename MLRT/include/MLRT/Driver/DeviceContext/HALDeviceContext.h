@@ -144,6 +144,9 @@ public:
   /// without a dedicated constant (for example the mock test plugin) report
   /// the generic `gpuAPI`.
   API api() const { return api_; }
+  /// The plugin's own API name ("cuda", "metal", "vulkan"), which `api()`
+  /// maps to the generic `gpuAPI` when it has no dedicated constant.
+  const std::string &pluginAPI() const { return apiStr_; }
   int id() const { return id_; }
   /// Whether this is a virtual (compile-only) device.
   bool isVirtual() const { return compilationDevice_ != nullptr; }
