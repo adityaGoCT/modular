@@ -78,6 +78,7 @@ from ._multistage_gemm_gpu import (
     multistage_gemm_split_k_kernel,
 )
 from .apple import enqueue_apple_matmul
+from .adreno import enqueue_adreno_coopmat_matmul
 from .apple.gemv import (
     apple_gemv_small_batch_supported,
     enqueue_apple_gemv,
@@ -868,10 +869,35 @@ def _matmul_gpu_impl[
         sep="",
     )
 
-    # Adreno 7xx through Vulkan SPIR-V has no matrix units, so it takes the
-    # SIMT kernel; the shape-based paths below assume tensor or matrix cores.
-    # Adreno 8xx, with KHR cooperative matrices, would branch here too.
+    # Adreno through Vulkan SPIR-V: the Adreno 8xx target multiplies fp16
+    # tiles of 16 with KHR cooperative matrices; everything else, and the
+    # Adreno 7xx (no matrix units), takes the SIMT kernel. The shape-based
+    # paths below assume tensor or matrix cores.
     comptime if ctx.target.is_triple["spirv1.6-unknown-vulkan1.3-compute"]():
+        comptime if (
+            ctx.target._is_arch["adreno840"]()
+            and a_type == DType.float16
+            and b_type == DType.float16
+            and c_type in (DType.float16, DType.float32)
+            and not has_epilogue_fn
+            and not has_compute_fn
+        ):
+            if (
+                m % 16 == 0
+                and n % 16 == 0
+                and k % 16 == 0
+                and a.layout.stride[1]().value() == 1
+                and b.layout.stride[1]().value() == 1
+                and c.layout.stride[1]().value() == 1
+            ):
+                logger.info(
+                    "Executing: cooperative-matrix MATMUL kernel (Adreno,"
+                    " KHR cooperative matrix)"
+                )
+                enqueue_adreno_coopmat_matmul[transpose_b=transpose_b](
+                    c, a, b, m, n, k, ctx
+                )
+                return
         logger.info("Executing: Naive MATMUL kernel (Adreno, no matrix units)")
         enqueue_matmul_kernel_naive[
             transpose_b=transpose_b,
