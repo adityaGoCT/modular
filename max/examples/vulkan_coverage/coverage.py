@@ -1,11 +1,12 @@
-"""Compile-only test of MAX graphs for the Vulkan SPIR-V target (Adreno 710).
+"""Compile-only test of MAX graphs for the Vulkan SPIR-V targets (Adreno).
 
 MAX's virtual-device mode stands in for a GPU that is not present: the graph
-compiler and MAX's kernel library compile for `vulkan:adreno710` exactly as for
-a real device, and nothing runs. Each case is a one-op graph, then a full
-ResNet-18; the report says which MAX kernels compile for the target.
+compiler and MAX's kernel library compile for `vulkan:adreno710` (or the arch
+given with `--arch=`) exactly as for a real device, and nothing runs. Each case
+is a one-op graph, then a full ResNet-18; the report says which MAX kernels
+compile for the target. `adreno840` takes the cooperative-matrix matmul.
 
-  ./bazelw run //max/examples/vulkan_coverage:coverage
+  ./bazelw run //max/examples/vulkan_coverage:coverage [-- --arch=adreno840]
 """
 
 import re
@@ -20,7 +21,8 @@ from max.engine import InferenceSession
 from max.graph import DeviceRef, Graph, TensorType, ops
 
 driver.set_virtual_device_api("vulkan")
-driver.set_virtual_device_target_arch("adreno710")
+ARCH = next((a.split("=", 1)[1] for a in sys.argv if a.startswith("--arch=")), "adreno710")
+driver.set_virtual_device_target_arch(ARCH)
 driver.set_virtual_device_count(1)
 
 GPU = DeviceRef.GPU()
@@ -77,6 +79,7 @@ CASES = [
         x, const((256,)), const((256,)), epsilon=1e-5)),
     two_inputs("matmul f32 256x256", (256, 256), (256, 256), lambda a, b: a @ b),
     two_inputs("matmul f16 256x256", (256, 256), (256, 256), lambda a, b: a @ b, dtype=DType.float16),
+    two_inputs("matmul f16 a @ b.T", (256, 128), (64, 128), lambda a, b: a @ b.T, dtype=DType.float16),
     two_inputs("matmul (gemv) 1x2048x2048", (1, 2048), (2048, 2048), lambda a, b: a @ b),
     one_input("conv2d 3x3", (1, 56, 56, 64), lambda x: ops.conv2d(
         x, const((3, 3, 64, 64)), stride=(1, 1), padding=(1, 1, 1, 1))),
@@ -126,8 +129,8 @@ def main():
     print(f"device: {driver.Accelerator()}  (virtual, compile-only)")
     results = []
     for name, _ in CASES:  # one process per case: a compiler abort ends only that case
-        r = subprocess.run([sys.executable, sys.argv[0], "--case", name], capture_output=True, text=True,
-                           timeout=1800)
+        r = subprocess.run([sys.executable, sys.argv[0], "--case", name, f"--arch={ARCH}"],
+                           capture_output=True, text=True, timeout=1800)
         line = next((l for l in r.stdout.splitlines() if l.startswith("RESULT|")), None)
         if line:
             _, status, detail = line.split("|", 2)
@@ -137,7 +140,7 @@ def main():
         results.append((name, status, detail))
         print(f"{name:28s} {status:5s} {detail}", flush=True)
     passed = sum(r[1] == "PASS" for r in results)
-    print(f"\n{passed}/{len(results)} compile for vulkan:adreno710")
+    print(f"\n{passed}/{len(results)} compile for vulkan:{ARCH}")
 
 
 if __name__ == "__main__":

@@ -4,7 +4,7 @@ This branch adds an experimental GPU target, `adreno710`, to the open-source
 Mojo compiler and MAX: Mojo kernels compile straight to Vulkan compute shaders
 (SPIR-V) for a Qualcomm Adreno 710, through LLVM's SPIR-V backend. It is a
 prototype, not a Modular product. The project around it (test kernels, the
-Vulkan runners, Llama 3.2 1B on the phone, and a 25-slide presentation) is at
+Vulkan runners, Llama 3.2 1B on the phone, and a 26-slide presentation) is at
 [adityaGoCT/mojo-adreno](https://github.com/adityaGoCT/mojo-adreno). The
 presentation, with speaker notes, is also
 [online](https://claude.ai/artifact/9HodHBDh22HuBYoo5UxTN6).
@@ -21,11 +21,12 @@ retargeter's times, and Llama 48 of 48 tokens at 281.0 ms a token.
   retargeted Mojo's AMD LLVM IR (block sum 4.9-6.3 ms vs 11-14 ms).
 - Llama 3.2 1B Instruct with seven Mojo kernels: 48 of 48 tokens identical to
   PyTorch, logits within 6.2e-5, 283.6 ms a token.
-- MAX graphs, compile only (MAX's virtual-device mode, nothing runs): all 25
+- MAX graphs, compile only (MAX's virtual-device mode, nothing runs): all 26
   test graphs give SPIR-V that passes `spirv-val` for every kernel, 211
   kernels in all: elementwise ops, cast, transpose, slice, concat, gather,
-  reductions, argmax, softmax, layer_norm, three matmuls, conv2d, both pools,
-  and a full ResNet-18 (74 kernels).
+  reductions, argmax, softmax, layer_norm, four matmuls (one with B
+  transposed, added with the cooperative-matrix work), conv2d, both pools, and
+  a full ResNet-18 (74 kernels).
 - MAX's kernels on the phone: the 43 kernels of 13 of those graphs (all
   variants of MAX's elementwise kernel for eight ops, the f32 to f16 cast,
   transpose, and the naive matmul at 256x256 f32 and f16 and a 1x2048x2048
@@ -39,11 +40,12 @@ MAX's runtime has no Vulkan backend and no Android build, so the phone joins
 MAX as a remote device instead: MAX runs on the Mac (graph compiler, host code,
 its HAL device layer), and a driver plugin (`M_driver_*`, in mojo-adreno's
 `remote/`) forwards allocations, copies and kernel launches over `adb forward`
-to a small Vulkan executor on the phone. All 25 test graphs run this way and
-match NumPy or MAX on the Mac's CPU, ResNet-18 included (max error 5.7e-5,
-8.3 s per image once its weights are on the phone; the plugin streams requests
-and the phone pipelines the GPU work, so that is GPU time, mostly MAX's naive
-conv2d, which runs one thread per output pixel across all output channels):
+to a small Vulkan executor on the phone. The 25 original test graphs all run
+this way and match NumPy or MAX on the Mac's CPU, ResNet-18 included (max error
+5.7e-5, 8.3 s per image once its weights are on the phone; the plugin streams
+requests and the phone pipelines the GPU work, so that is GPU time, mostly
+MAX's naive conv2d, which runs one thread per output pixel across all output
+channels):
 
 ```bash
 BAZELISK_SKIP_WRAPPER=true ./bazelw build --config=disable-lint \
@@ -61,6 +63,52 @@ its HAL overlay, so the kernel packages match the runtime's `DeviceContext`;
 `Device::API` constant still yields its `vendor:arch`; and a `spirv` HAL plugin
 gives the SPIR-V target a plain grid-and-block launch.
 
+## Cooperative matrices (KHR) for Adreno 8xx
+
+A second target, `adreno840`, gives the same SPIR-V and also lets kernels use
+`SPV_KHR_cooperative_matrix`: 16x16 tiles that a subgroup loads, multiply-adds
+and stores together, which a driver with `VK_KHR_cooperative_matrix` maps to
+the GPU's matrix hardware. In Mojo they are
+`max.gpu.compute.arch.mma_spirv.CoopMatrix`:
+
+```mojo
+from max.gpu.compute.arch.mma_spirv import CoopMatrix, MATRIX_A, MATRIX_B, ACCUMULATOR
+
+var acc = CoopMatrix[DType.float32, 16, 16, ACCUMULATOR].zero()
+for k in range(0, K, 16):
+    var a_tile = CoopMatrix[DType.float16, 16, 16, MATRIX_A].load(a.unsafe_offset(row * K + k), K)
+    var b_tile = CoopMatrix[DType.float16, 16, 16, MATRIX_B].load(b.unsafe_offset(k * N + col), N)
+    acc = a_tile.multiply_add(b_tile, acc)
+acc.cast[DType.float16]().store(c.unsafe_offset(row * N + col), N)
+```
+
+Each operation is a call to a marker function (`__mojo_spirv_coopmat_*`) that
+carries the matrix as an opaque 64-bit handle. The kernel ABI pass resolves
+each load's and store's pointer to a buffer or shared array and an element
+index, types every handle (also through phis, such as the accumulator of the K
+loop), and rewrites the markers into LLVM's `__spirv_CooperativeMatrix*KHR`
+builtins and `OpFConvert`; a module that uses them switches to the Vulkan
+memory model, which the extension requires. A patch to LLVM
+(`llvm-spirv-cooperative-matrix-vulkan.patch`) lets shaders use those builtins,
+which LLVM had recorded for OpenCL only, and makes the two extensions available
+to Vulkan triples. Other kernels come out as before.
+
+MAX's matmul takes a cooperative-matrix kernel
+(`max/kernels/src/linalg/matmul/gpu/adreno/`) on `adreno840` when A and B are
+fp16, C is fp16 or fp32, there is no epilogue, and M, N and K are multiples of
+16 with contiguous rows: one subgroup per 16x16 tile of C, accumulating in
+fp32. Everything else takes the naive kernel.
+
+Compile-only results, with MAX's virtual device for `vulkan:adreno840`
+(`coverage.py --arch=adreno840`): all 26 test graphs compile and all 213
+kernels pass `spirv-val` for Vulkan 1.3. Both fp16 matmul graphs, `a @ b` and
+`a @ b.T` (which the graph compiler turns into a matmul with B transposed),
+take the cooperative-matrix kernel: two `OpCooperativeMatrixLoadKHR` (B
+column-major when transposed) and an `OpCooperativeMatrixMulAddKHR` in the K
+loop, then `OpFConvert` to fp16 and `OpCooperativeMatrixStoreKHR`. Kernels for
+`adreno710` come out as before (GLSL450 memory model, no extensions), and the
+eight test kernels still pass on the phone.
+
 ## How it fits together
 
 | Piece | Files |
@@ -76,6 +124,7 @@ gives the SPIR-V target a plain grid-and-block launch.
 | MAX compile test, and graphs on the remote device (`remote.py`) | `max/examples/vulkan_coverage/` |
 | MAX's HAL device layer for the target: `spirv` HAL plugin, `vulkan` vendor | `max/mojo/max/_driver/max_license/hal/_plugin/spirv/`, `MLRT/include/MLRT/Driver/DeviceContext/DeviceAPINames.h` |
 | LLVM's SPIR-V backend in Mojo's LLVM build, and a structurizer fix | `bazel/public-patches/llvm.MODULE.bazel`, `llvm-spirv-structurizer-split-headers.patch` |
+| KHR cooperative matrices: Mojo API, `adreno840` target, LLVM patch, MAX matmul | `max/mojo/max/gpu/compute/arch/mma_spirv.mojo`, `max/mojo/max/_plugin/spirv/targets.mojo`, `llvm-spirv-cooperative-matrix-vulkan.patch`, `max/kernels/src/linalg/matmul/gpu/adreno/` |
 
 ## Kernel ABI
 
@@ -129,7 +178,8 @@ bazel-bin/Mojo/tools/mojo/mojo build --emit asm --target-accelerator adreno710 \
 # -> one .spv per kernel, next to host.s
 ```
 
-The MAX compile test:
+The MAX compile test (`-- --arch=adreno840` for the cooperative-matrix
+target):
 
 ```bash
 ./bazelw run --config=disable-lint //max/examples/vulkan_coverage:coverage
@@ -159,7 +209,15 @@ kernel.
   workgroup-scope barrier on storage buffers. `warp.sum` is one subgroup
   reduction, exact with 64-lane subgroups or workgroups of at most 64.
 - MAX itself does not run on the phone: it drives the phone remotely from the
-  Mac, synchronously, one round trip per operation. An on-device runtime needs
-  an Android build of MAX's runtime and the Vulkan plugin running locally.
+  Mac over adb. An on-device runtime needs an Android build of MAX's runtime
+  and the Vulkan plugin running locally.
+- Cooperative matrices are compile-only so far: neither of the Adreno 710's
+  drivers (Turnip, stock) exposes `VK_KHR_cooperative_matrix`, so nothing has
+  run on matrix hardware. The kernels assume 16x16x16 fp16 products with an
+  fp32 or fp16 accumulator; a driver lists the shapes it supports
+  (`vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR`, printed by
+  `coopmat/vk_coopmat_probe.c` in mojo-adreno). Integer products are not
+  lowered yet, and each subgroup computes one tile, without shared-memory
+  staging or reuse across tiles.
 - `Mojo/lib/Elaborator/Elaborator.cpp`: a second error on a node keeps the
   first instead of aborting, so failures are reported.
