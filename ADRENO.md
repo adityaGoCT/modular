@@ -4,7 +4,7 @@ This branch adds an experimental GPU target, `adreno710`, to the open-source
 Mojo compiler and MAX: Mojo kernels compile straight to Vulkan compute shaders
 (SPIR-V) for a Qualcomm Adreno 710, through LLVM's SPIR-V backend. It is a
 prototype, not a Modular product. The project around it (test kernels, the
-Vulkan runners, Llama 3.2 1B on the phone, and a 24-slide presentation) is at
+Vulkan runners, Llama 3.2 1B on the phone, and a 25-slide presentation) is at
 [adityaGoCT/mojo-adreno](https://github.com/adityaGoCT/mojo-adreno). The
 presentation, with speaker notes, is also
 [online](https://claude.ai/artifact/9HodHBDh22HuBYoo5UxTN6).
