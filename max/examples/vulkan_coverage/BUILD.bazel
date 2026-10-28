@@ -16,3 +16,22 @@ modular_py_binary(
         requirement("numpy"),
     ],
 )
+
+# MAX graphs run on a remote Vulkan device: a phone's Adreno 710 through a driver
+# plugin (MODULAR_DRIVER_PLUGINS). Needs the HAL device context
+# (--//:hal_device_context=true).
+modular_py_binary(
+    name = "remote",
+    srcs = [
+        "remote.py",
+        "resnet18_graph.py",
+    ],
+    imports = ["."],
+    deps = [
+        "//max/python/max/driver",
+        "//max/python/max/dtype",
+        "//max/python/max/engine",
+        "//max/python/max/graph",
+        requirement("numpy"),
+    ],
+)

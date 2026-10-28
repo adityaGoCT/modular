@@ -27,23 +27,26 @@ for stage, cout in enumerate((64, 128, 256, 512)):
         cin = cout
 FC = ((rng.standard_normal((512, 1000)) * 0.02).astype(np.float32), np.zeros(1000, np.float32))
 
+def forward(x, device):
+    """ResNet-18 on `x` (1, 224, 224, 3), inside a graph being built."""
+    def conv(x, name, stride, pad, relu):
+        f, b = W[name]
+        y = ops.conv2d(x, ops.constant(f, DType.float32, device=device), stride=(stride, stride),
+                       padding=(pad, pad, pad, pad), bias=ops.constant(b, DType.float32, device=device))
+        return ops.relu(y) if relu else y
+    x = conv(x, "stem", 2, 3, True)
+    x = ops.max_pool2d(x, kernel_size=(3, 3), stride=2, padding=1)
+    for n, ci, co, s in blocks:
+        y = conv(x, n + "c1", s, 1, True)
+        y = conv(y, n + "c2", 1, 1, False)
+        sc = conv(x, n + "ds", s, 0, False) if (n + "ds") in W else x
+        x = ops.relu(y + sc)
+    x = ops.mean(ops.mean(x, axis=1), axis=2)            # global average pool -> (1, 1, 1, 512)
+    x = ops.reshape(x, (1, 512))
+    return x @ ops.constant(FC[0], DType.float32, device=device) + ops.constant(FC[1], DType.float32, device=device)
+
+
 def build(device):
     with Graph("resnet18", input_types=[TensorType(DType.float32, (1, 224, 224, 3), device=device)]) as g:
-        def conv(x, name, stride, pad, relu):
-            f, b = W[name]
-            y = ops.conv2d(x, ops.constant(f, DType.float32, device=device), stride=(stride, stride),
-                           padding=(pad, pad, pad, pad), bias=ops.constant(b, DType.float32, device=device))
-            return ops.relu(y) if relu else y
-        x = conv(g.inputs[0].tensor, "stem", 2, 3, True)
-        x = ops.max_pool2d(x, kernel_size=(3, 3), stride=2, padding=1)
-        for n, ci, co, s in blocks:
-            y = conv(x, n + "c1", s, 1, True)
-            y = conv(y, n + "c2", 1, 1, False)
-            sc = conv(x, n + "ds", s, 0, False) if (n + "ds") in W else x
-            x = ops.relu(y + sc)
-        x = ops.mean(ops.mean(x, axis=1), axis=2)            # global average pool -> (1, 1, 1, 512)
-        x = ops.reshape(x, (1, 512))
-        x = x @ ops.constant(FC[0], DType.float32, device=device) + ops.constant(FC[1], DType.float32, device=device)
-        g.output(x)
+        g.output(forward(g.inputs[0].tensor, device))
     return g
-

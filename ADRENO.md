@@ -33,6 +33,32 @@ retargeter's times, and Llama 48 of 48 tokens at 281.0 ms a token.
   and match NumPy (`max_kernels/test_max_kernels.py` in mojo-adreno). The
   other graphs' kernels have not run yet.
 
+## MAX on the phone: a remote device
+
+MAX's runtime has no Vulkan backend and no Android build, so the phone joins
+MAX as a remote device instead: MAX runs on the Mac (graph compiler, host code,
+its HAL device layer), and a driver plugin (`M_driver_*`, in mojo-adreno's
+`remote/`) forwards allocations, copies and kernel launches over `adb forward`
+to a small Vulkan executor on the phone. All 25 test graphs run this way and
+match NumPy or MAX on the Mac's CPU, ResNet-18 included (max error 5.7e-5,
+14 s, most of it one network round trip per launch):
+
+```bash
+BAZELISK_SKIP_WRAPPER=true ./bazelw build --config=disable-lint \
+    --//:hal_device_context=true //max/examples/vulkan_coverage:remote //Target:CPUPlugin.so
+# phone: vk_server (remote/ in mojo-adreno), then: adb forward tcp:7788 tcp:7788
+MODULAR_DRIVER_PLUGINS="cpu@bazel-bin/Target/CPUPlugin.so;vulkan@/path/libM_driver_vulkan_remote.dylib" \
+    ./bazelw run --config=disable-lint --//:hal_device_context=true \
+    //max/examples/vulkan_coverage:remote
+```
+
+What it took in this tree: MAX's HAL device layer (`--//:hal_device_context`,
+whose `--config` alias is internal) now also builds the `max` Mojo package from
+its HAL overlay, so the kernel packages match the runtime's `DeviceContext`;
+`vulkan` is a Mojo vendor (`DeviceAPINames.h`), and a plugin API without a
+`Device::API` constant still yields its `vendor:arch`; and a `spirv` HAL plugin
+gives the SPIR-V target a plain grid-and-block launch.
+
 ## How it fits together
 
 | Piece | Files |
@@ -45,7 +71,8 @@ retargeter's times, and Llama 48 of 48 tokens at 281.0 ms a token.
 | New MAX hook `warp_sum_fn` | `max/mojo/max/_plugin/_trait.mojo`, `max/mojo/max/gpu/primitives/warp.mojo` |
 | Matmul on GPUs without matrix units | `max/kernels/src/linalg/matmul/gpu/__init__.mojo` |
 | Compile-only virtual Vulkan device | `MLRT/lib/Driver/DeviceContext/CompilationDevice.cpp` |
-| MAX compile test | `max/examples/vulkan_coverage/` |
+| MAX compile test, and graphs on the remote device (`remote.py`) | `max/examples/vulkan_coverage/` |
+| MAX's HAL device layer for the target: `spirv` HAL plugin, `vulkan` vendor | `max/mojo/max/_driver/max_license/hal/_plugin/spirv/`, `MLRT/include/MLRT/Driver/DeviceContext/DeviceAPINames.h` |
 | LLVM's SPIR-V backend in Mojo's LLVM build, and a structurizer fix | `bazel/public-patches/llvm.MODULE.bazel`, `llvm-spirv-structurizer-split-headers.patch` |
 
 ## Kernel ABI
@@ -123,15 +150,14 @@ kernel.
 - Codegen runs at -O0 to avoid an LLVM 24 SPIR-V crash (loop strength
   reduction). A second LLVM bug, which put an OpSelectionMerge before an
   unconditional branch, is patched in this branch.
-- Only 13 of the 25 MAX test graphs have run on the phone, each kernel with
-  arguments filled in by a test script rather than MAX's runtime. Loads
+- Loads
   through a pointer into several buffers also read element 0 of the others,
   which must not be empty.
 - `barrier()` orders shared memory only; LLVM has no intrinsic for a
   workgroup-scope barrier on storage buffers. `warp.sum` is one subgroup
   reduction, exact with 64-lane subgroups or workgroups of at most 64.
-- There is no MAX runtime for Vulkan or Android: kernels run through small C
-  programs in mojo-adreno. A Vulkan driver plugin and an Android build would be
-  next.
+- MAX itself does not run on the phone: it drives the phone remotely from the
+  Mac, synchronously, one round trip per operation. An on-device runtime needs
+  an Android build of MAX's runtime and the Vulkan plugin running locally.
 - `Mojo/lib/Elaborator/Elaborator.cpp`: a second error on a node keeps the
   first instead of aborting, so failures are reported.
