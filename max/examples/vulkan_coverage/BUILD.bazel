@@ -1,0 +1,18 @@
+load("//bazel:api.bzl", "modular_py_binary", "requirement")
+
+# Compile-only coverage of MAX graphs for the Vulkan SPIR-V target (prototype).
+modular_py_binary(
+    name = "coverage",
+    srcs = [
+        "coverage.py",
+        "resnet18_graph.py",
+    ],
+    imports = ["."],
+    deps = [
+        "//max/python/max/driver",
+        "//max/python/max/dtype",
+        "//max/python/max/engine",
+        "//max/python/max/graph",
+        requirement("numpy"),
+    ],
+)
