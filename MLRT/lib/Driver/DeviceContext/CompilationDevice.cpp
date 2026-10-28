@@ -44,6 +44,32 @@ MODULAR_CXX_EXPORT std::string DriverVersion::toString() const {
   return version_;
 }
 
+namespace {
+/// Compile-only device for Vulkan SPIR-V targets (prototype). As with HIP, KGEN
+/// compiles the kernels itself, through LLVM's SPIR-V backend; the device only
+/// names the target architecture for `--target-accelerator`.
+class VulkanCompilationDevice final : public CompilationDevice {
+public:
+  explicit VulkanCompilationDevice(std::string targetArch)
+      : CompilationDevice("vulkan", std::move(targetArch)) {}
+
+  ErrorOr<int> getApiVersion() const override {
+    return Error("VulkanCompilationDevice is compile-only");
+  }
+  ErrorOr<DriverVersion &> getDriverVersion() const override {
+    return Error("VulkanCompilationDevice is compile-only");
+  }
+  ErrorOr<const char *> getArchName() const override {
+    return targetArch().c_str();
+  }
+  ErrorOr<M::BufferRef> compileFunction(StringRef, StringRef, int32_t,
+                                        StringRef) const override {
+    return Error("Vulkan kernels are compiled to SPIR-V by KGEN, not at run "
+                 "time");
+  }
+};
+} // namespace
+
 MODULAR_CXX_EXPORT ErrorOr<std::unique_ptr<CompilationDevice>>
 CompilationDevice::create(StringRef requestedAPI, StringRef arch) {
   const StringRef api = canonicalDeviceAPI(requestedAPI);
@@ -75,6 +101,9 @@ CompilationDevice::create(StringRef requestedAPI, StringRef arch) {
     }
 
     return std::move(*compilationDeviceOrErr);
+  } else if (api == "vulkan") {
+    return std::unique_ptr<CompilationDevice>(
+        new VulkanCompilationDevice(arch.str()));
   } else if (api == "metal") {
     // TODO: Implement MetalCompilationDevice for Apple GPU compilation
     return Error("Metal virtual device mode not yet implemented. "
