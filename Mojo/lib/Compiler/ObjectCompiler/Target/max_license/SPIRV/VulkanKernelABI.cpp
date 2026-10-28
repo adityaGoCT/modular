@@ -88,6 +88,46 @@ ErrorOr<std::pair<LocalSize, bool>> getLocalSize() {
   return std::make_pair(size, true);
 }
 
+// Cooperative-matrix markers from Mojo's SPIR-V MAX plugin. A matrix travels
+// as an i64 handle; dtype codes are 0 f16, 1 f32, 2 bf16, 3 i8, 4 i32.
+//   load(ptr, i32 stride, i32 layout, i32 dtype, i32 rows, i32 cols, i32 use)
+//   zero(i32 dtype, i32 rows, i32 cols, i32 use)
+//   mma(i64 a, i64 b, i64 c)            c + a x b
+//   convert(i64 matrix, i32 dtype)      to another float element type
+//   store(ptr, i64 matrix, i32 stride, i32 layout, i32 dtype)
+constexpr StringLiteral kCoopLoad = "__mojo_spirv_coopmat_load";
+constexpr StringLiteral kCoopZero = "__mojo_spirv_coopmat_zero";
+constexpr StringLiteral kCoopMma = "__mojo_spirv_coopmat_mma";
+constexpr StringLiteral kCoopConvert = "__mojo_spirv_coopmat_convert";
+constexpr StringLiteral kCoopStore = "__mojo_spirv_coopmat_store";
+
+/// The name of the cooperative-matrix marker `value` calls, or "".
+StringRef coopmatMarker(const Value *value) {
+  auto *call = dyn_cast<CallInst>(value);
+  Function *callee = call ? call->getCalledFunction() : nullptr;
+  if (!callee || !callee->getName().starts_with("__mojo_spirv_coopmat_"))
+    return {};
+  return callee->getName();
+}
+
+/// The component type of a cooperative-matrix dtype code.
+Type *coopmatElementType(LLVMContext &ctx, uint64_t code) {
+  switch (code) {
+  case 0:
+    return Type::getHalfTy(ctx);
+  case 1:
+    return Type::getFloatTy(ctx);
+  case 2:
+    return Type::getBFloatTy(ctx);
+  case 3:
+    return Type::getInt8Ty(ctx);
+  case 4:
+    return Type::getInt32Ty(ctx);
+  default:
+    return nullptr;
+  }
+}
+
 std::string printed(const Type &type) {
   std::string text;
   raw_string_ostream os(text);
@@ -150,8 +190,17 @@ Type *inferElementType(Value *root) {
         type = rmw->getType();
       else if (auto *cmpxchg = dyn_cast<AtomicCmpXchgInst>(user))
         type = cmpxchg->getCompareOperand()->getType();
-      else if (isa<GetElementPtrInst, AddrSpaceCastInst, BitCastInst, PHINode,
-                   SelectInst>(user))
+      else if (StringRef marker = coopmatMarker(user);
+               (marker == kCoopLoad || marker == kCoopStore) &&
+               cast<CallInst>(user)->getArgOperand(0) == value) {
+        // A cooperative matrix's component type.
+        auto *code = dyn_cast<ConstantInt>(
+            cast<CallInst>(user)->getArgOperand(marker == kCoopLoad ? 3 : 4));
+        type =
+            code ? coopmatElementType(value->getContext(), code->getZExtValue())
+                 : nullptr;
+      } else if (isa<GetElementPtrInst, AddrSpaceCastInst, BitCastInst, PHINode,
+                     SelectInst>(user))
         work.push_back(user);
       if (!type)
         continue;
@@ -192,6 +241,9 @@ public:
   ErrorOrSuccess run();
   /// The kernel's launch description (JSON), once `run` succeeded.
   const std::string &getDescription() const { return description; }
+  /// Whether the kernel uses cooperative matrices (which need the Vulkan
+  /// memory model).
+  bool usesCooperativeMatrices() const { return !coopmatCalls.empty(); }
 
 private:
   /// Memory a pointer reaches: a storage buffer or a shared array, or a group
@@ -251,6 +303,9 @@ private:
   ErrorOrSuccess finishPhis();
   ErrorOrSuccess expandGroupAccesses();
   ErrorOrSuccess expandMemIntrinsics();
+  ErrorOrSuccess lowerCooperativeMatrices();
+  Function *coopmatBuiltin(StringRef name, Type *result,
+                           ArrayRef<Type *> params);
   ErrorOrSuccess eraseDead();
 
   Module &module;
@@ -276,6 +331,10 @@ private:
   /// shared arrays, expanded once the traversal is done.
   SmallVector<std::pair<Instruction *, Address>> groupAccesses;
   SmallVector<MemIntrinsic *> memIntrinsics;
+  /// Cooperative-matrix markers, in program order, and the memory a load or
+  /// store marker addresses.
+  SmallVector<CallInst *> coopmatCalls;
+  DenseMap<CallInst *, Address> coopmatAddresses;
   SmallVector<Instruction *> dead;
   SmallVector<GlobalVariable *> retypedGlobals;
 };
@@ -691,6 +750,21 @@ ErrorOrSuccess KernelRewriter::visit(Instruction &inst) {
       return std::nullopt;
     return it->second;
   };
+
+  // Cooperative-matrix markers are rewritten once every address is known.
+  if (StringRef marker = coopmatMarker(&inst); !marker.empty()) {
+    auto *call = cast<CallInst>(&inst);
+    if (marker == kCoopLoad || marker == kCoopStore) {
+      std::optional<Address> address = addressOf(call->getArgOperand(0));
+      if (!address || !roots[address->root].choices.empty())
+        return Error("cooperative matrix access outside one buffer or shared "
+                     "array: " +
+                     printed(inst));
+      coopmatAddresses[call] = *address;
+    }
+    coopmatCalls.push_back(call);
+    return {};
+  }
 
   // A phi or select of addresses into one buffer or array becomes a phi or
   // select of element indices; into several, also of selectors.
@@ -1431,6 +1505,223 @@ ErrorOrSuccess KernelRewriter::expandMemIntrinsics() {
   return {};
 }
 
+/// Returns a declaration of LLVM's SPIR-V builtin `name` with this signature.
+/// The backend takes a builtin's result type from its declaration, so each
+/// signature gets its own Itanium-mangled name (a different parameter list:
+/// void*, int, int, ...), all of which demangle to `name`.
+Function *KernelRewriter::coopmatBuiltin(StringRef name, Type *result,
+                                         ArrayRef<Type *> params) {
+  FunctionType *type = FunctionType::get(result, params, /*isVarArg=*/false);
+  for (unsigned ints = 1;; ++ints) {
+    std::string mangled =
+        ("_Z" + Twine(name.size()) + name + "Pv" + std::string(ints, 'i'))
+            .str();
+    Function *fn = module.getFunction(mangled);
+    if (!fn) {
+      fn =
+          Function::Create(type, GlobalValue::ExternalLinkage, mangled, module);
+      fn->setCallingConv(CallingConv::SPIR_FUNC);
+      return fn;
+    }
+    if (fn->getFunctionType() == type)
+      return fn;
+  }
+}
+
+/// Rewrites the cooperative-matrix markers into SPIR-V cooperative matrices
+/// (`spirv.CooperativeMatrixKHR`, subgroup scope) and the
+/// __spirv_CooperativeMatrix* builtins of LLVM's SPIR-V backend. The markers
+/// pass each matrix as an i64 handle, which may flow through phis (an
+/// accumulator carried around a loop); those become phis of matrices.
+ErrorOrSuccess KernelRewriter::lowerCooperativeMatrices() {
+  if (coopmatCalls.empty())
+    return {};
+  auto constantArg = [](CallInst *call, unsigned i) {
+    auto *c = dyn_cast<ConstantInt>(call->getArgOperand(i));
+    return c ? c->getZExtValue() : ~0ull;
+  };
+  // The phis that carry handles: every user of a handle is a marker or one.
+  SmallVector<PHINode *> handlePhis;
+  SmallPtrSet<Value *, 16> handles;
+  SmallVector<Value *> work;
+  for (CallInst *call : coopmatCalls)
+    if (coopmatMarker(call) != kCoopStore)
+      work.push_back(call);
+  while (!work.empty()) {
+    Value *handle = work.pop_back_val();
+    if (!handles.insert(handle).second)
+      continue;
+    for (User *user : handle->users()) {
+      if (auto *phi = dyn_cast<PHINode>(user)) {
+        if (!handles.contains(phi))
+          handlePhis.push_back(phi), work.push_back(phi);
+        continue;
+      }
+      StringRef marker = coopmatMarker(user);
+      if (marker != kCoopMma && marker != kCoopConvert && marker != kCoopStore)
+        return Error("unsupported use of a cooperative matrix: " +
+                     printed(*user));
+    }
+  }
+  // The matrix type of each handle: from its load or zero, the accumulator of
+  // its mma, its source with another element type (convert), or any input of
+  // its phi.
+  DenseMap<Value *, Type *> types;
+  std::function<Type *(Value *)> typeOf = [&](Value *value) -> Type * {
+    if (auto it = types.find(value); it != types.end())
+      return it->second;
+    types[value] = nullptr; // a cycle of phis is typed from outside it
+    Type *type = nullptr;
+    StringRef marker = coopmatMarker(value);
+    auto *call = dyn_cast<CallInst>(value);
+    if (marker == kCoopLoad || marker == kCoopZero) {
+      unsigned at = marker == kCoopLoad ? 3 : 0;
+      Type *element = coopmatElementType(ctx, constantArg(call, at));
+      uint64_t rows = constantArg(call, at + 1),
+               cols = constantArg(call, at + 2),
+               use = constantArg(call, at + 3);
+      if (element && rows && rows <= 256 && cols && cols <= 256 && use <= 2)
+        type = TargetExtType::get(ctx, "spirv.CooperativeMatrixKHR", {element},
+                                  {/*Subgroup=*/3, static_cast<unsigned>(rows),
+                                   static_cast<unsigned>(cols),
+                                   static_cast<unsigned>(use)});
+    } else if (marker == kCoopMma) {
+      type = typeOf(call->getArgOperand(2));
+    } else if (marker == kCoopConvert) {
+      auto *source =
+          cast_or_null<TargetExtType>(typeOf(call->getArgOperand(0)));
+      Type *element = coopmatElementType(ctx, constantArg(call, 1));
+      if (source && element) {
+        SmallVector<unsigned> params(source->int_params());
+        type = TargetExtType::get(ctx, "spirv.CooperativeMatrixKHR", {element},
+                                  params);
+      }
+    } else if (auto *phi = dyn_cast<PHINode>(value)) {
+      for (Value *input : phi->incoming_values())
+        if ((type = typeOf(input)))
+          break;
+    }
+    return types[value] = type;
+  };
+
+  DenseMap<Value *, Value *> typed;
+  for (PHINode *phi : handlePhis) {
+    Type *type = typeOf(phi);
+    if (!type)
+      return Error("cannot type a cooperative matrix: " + printed(*phi));
+    typed[phi] = PHINode::Create(type, phi->getNumIncomingValues(), "",
+                                 phi->getIterator());
+  }
+  for (CallInst *call : coopmatCalls) {
+    IRBuilder<> b(call);
+    StringRef marker = coopmatMarker(call);
+    auto memory = [&](Type *element) -> Value * {
+      const Address &address = coopmatAddresses[call];
+      const Root &root = roots[address.root];
+      if (root.elementType != element)
+        return nullptr;
+      return getPointer(b, root, address.index);
+    };
+    CallInst *result = nullptr;
+    if (marker == kCoopLoad || marker == kCoopZero) {
+      auto *type = cast_or_null<TargetExtType>(typeOf(call));
+      if (!type)
+        return Error("unsupported cooperative matrix: " + printed(*call));
+      Type *element = type->getTypeParameter(0);
+      if (marker == kCoopZero) {
+        result = b.CreateCall(
+            coopmatBuiltin("__spirv_CompositeConstruct", type, {element}),
+            {Constant::getNullValue(element)});
+      } else {
+        Value *pointer = memory(element);
+        if (!pointer)
+          return Error("cooperative matrix load from memory of another "
+                       "element type: " +
+                       printed(*call));
+        roots[coopmatAddresses[call].root].read = true;
+        // (pointer, layout, stride): the marker passes (pointer, stride,
+        // layout).
+        Value *layout = b.CreateZExtOrTrunc(call->getArgOperand(2), i32);
+        Value *stride = b.CreateZExtOrTrunc(call->getArgOperand(1), i32);
+        result =
+            b.CreateCall(coopmatBuiltin("__spirv_CooperativeMatrixLoadKHR",
+                                        type, {pointer->getType(), i32, i32}),
+                         {pointer, layout, stride});
+      }
+    } else if (marker == kCoopMma) {
+      Value *a = typed.lookup(call->getArgOperand(0));
+      Value *bm = typed.lookup(call->getArgOperand(1));
+      Value *c = typed.lookup(call->getArgOperand(2));
+      if (!a || !bm || !c)
+        return Error("cooperative matrix product of unknown matrices: " +
+                     printed(*call));
+      if (!cast<TargetExtType>(c->getType())
+               ->getTypeParameter(0)
+               ->isFloatingPointTy())
+        return Error("unsupported integer cooperative matrix product: " +
+                     printed(*call));
+      result = b.CreateCall(
+          coopmatBuiltin("__spirv_CooperativeMatrixMulAddKHR", c->getType(),
+                         {a->getType(), bm->getType(), c->getType()}),
+          {a, bm, c});
+    } else if (marker == kCoopConvert) {
+      Value *source = typed.lookup(call->getArgOperand(0));
+      auto *type = cast_or_null<TargetExtType>(typeOf(call));
+      if (!source || !type)
+        return Error("conversion of an unknown cooperative matrix: " +
+                     printed(*call));
+      if (!cast<TargetExtType>(source->getType())
+               ->getTypeParameter(0)
+               ->isFloatingPointTy() ||
+          !type->getTypeParameter(0)->isFloatingPointTy())
+        return Error("unsupported integer cooperative matrix conversion: " +
+                     printed(*call));
+      result = b.CreateCall(
+          coopmatBuiltin("__spirv_FConvert", type, {source->getType()}),
+          {source});
+    } else if (marker == kCoopStore) {
+      Value *matrix = typed.lookup(call->getArgOperand(1));
+      if (!matrix)
+        return Error("store of an unknown cooperative matrix: " +
+                     printed(*call));
+      Value *pointer =
+          memory(cast<TargetExtType>(matrix->getType())->getTypeParameter(0));
+      if (!pointer)
+        return Error("cooperative matrix store to memory of another element "
+                     "type: " +
+                     printed(*call));
+      roots[coopmatAddresses[call].root].written = true;
+      Value *stride = b.CreateZExtOrTrunc(call->getArgOperand(2), i32);
+      Value *layout = b.CreateZExtOrTrunc(call->getArgOperand(3), i32);
+      b.CreateCall(
+           coopmatBuiltin("__spirv_CooperativeMatrixStoreKHR",
+                          Type::getVoidTy(ctx),
+                          {pointer->getType(), matrix->getType(), i32, i32}),
+           {pointer, matrix, layout, stride})
+          ->setCallingConv(CallingConv::SPIR_FUNC);
+    } else {
+      return Error("unknown cooperative matrix marker: " + printed(*call));
+    }
+    if (result) {
+      result->setCallingConv(CallingConv::SPIR_FUNC);
+      typed[call] = result;
+    }
+    dead.push_back(call);
+  }
+  for (PHINode *phi : handlePhis) {
+    auto *matrices = cast<PHINode>(typed[phi]);
+    for (unsigned i = 0, e = phi->getNumIncomingValues(); i != e; ++i) {
+      Value *input = typed.lookup(phi->getIncomingValue(i));
+      if (!input)
+        return Error("phi of a cooperative matrix and another value: " +
+                     printed(*phi));
+      matrices->addIncoming(input, phi->getIncomingBlock(i));
+    }
+    dead.push_back(phi);
+  }
+  return {};
+}
+
 /// Erases the rewritten pointer computations. They may form cycles through
 /// phis, so every user must itself be rewritten before any is erased.
 ErrorOrSuccess KernelRewriter::eraseDead() {
@@ -1553,6 +1844,8 @@ ErrorOrSuccess KernelRewriter::run() {
     return err;
   if (ErrorOrSuccess err = expandMemIntrinsics())
     return err;
+  if (ErrorOrSuccess err = lowerCooperativeMatrices())
+    return err;
   if (ErrorOrSuccess err = eraseDead())
     return err;
 
@@ -1565,9 +1858,14 @@ ErrorOrSuccess KernelRewriter::run() {
     if (global->use_empty())
       global->eraseFromParent();
 
+  // Calls left are to intrinsics, and to the __spirv_* builtins that LLVM's
+  // SPIR-V backend turns into instructions.
   for (Instruction &inst : instructions(*entry))
     if (auto *call = dyn_cast<CallBase>(&inst);
-        call && !isa<IntrinsicInst>(call))
+        call && !isa<IntrinsicInst>(call) &&
+        !(call->getCalledFunction() &&
+          call->getCalledFunction()->isDeclaration() &&
+          call->getCalledFunction()->getName().contains("__spirv_")))
       return Error("kernel still calls a function (Vulkan entry points must "
                    "be fully inlined): " +
                    printed(inst));
@@ -1720,6 +2018,7 @@ ErrorOrSuccess lowerSPIRVKernelsToVulkan(Module &module,
   // Without MOJO_SPIRV_LOCAL_SIZE, the workgroup size is each launch's block
   // size: MAX picks it at the launch, while Vulkan fixes it per pipeline.
   info.specializeWorkgroupSize = !localSize->second;
+  bool usesCooperativeMatrices = false;
 
   SmallVector<Function *> kernels;
   for (Function &fn : module)
@@ -1748,6 +2047,18 @@ ErrorOrSuccess lowerSPIRVKernelsToVulkan(Module &module,
     if (ErrorOrSuccess err = rewriter.run())
       return err;
     info.descriptions.push_back(rewriter.getDescription());
+    usesCooperativeMatrices |= rewriter.usesCooperativeMatrices();
+  }
+  // Cooperative matrices in a shader require the Vulkan memory model, which
+  // LLVM's SPIR-V backend takes from this metadata: (Logical, Vulkan).
+  if (usesCooperativeMatrices &&
+      !module.getNamedMetadata("spirv.MemoryModel")) {
+    Type *i32 = Type::getInt32Ty(module.getContext());
+    module.getOrInsertNamedMetadata("spirv.MemoryModel")
+        ->addOperand(
+            MDNode::get(module.getContext(),
+                        {ConstantAsMetadata::get(ConstantInt::get(i32, 0)),
+                         ConstantAsMetadata::get(ConstantInt::get(i32, 3))}));
   }
   for (Function &fn : module)
     if (fn.hasFnAttribute("hlsl.shader"))

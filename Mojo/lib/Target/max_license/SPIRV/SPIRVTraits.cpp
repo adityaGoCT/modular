@@ -22,6 +22,8 @@ const SPIRVTraits &SPIRVTraits::get() {
 
 static constexpr TargetTraits::AcceleratorArch kSPIRVAcceleratorArchs[] = {
     {"adreno710", "Qualcomm Adreno 710 (Vulkan 1.3 SPIR-V, 64-lane warps)"},
+    {"adreno840", "Qualcomm Adreno 840 (Vulkan 1.3 SPIR-V, 64-lane warps, "
+                  "KHR cooperative matrices)"},
 };
 
 llvm::ArrayRef<TargetTraits::AcceleratorArch>
