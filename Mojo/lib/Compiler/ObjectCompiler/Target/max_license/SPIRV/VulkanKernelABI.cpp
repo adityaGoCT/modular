@@ -38,6 +38,7 @@
 #include "llvm/IR/ReplaceConstant.h"
 #include "llvm/IR/Verifier.h"
 #include "llvm/Passes/PassBuilder.h"
+#include "llvm/Support/JSON.h"
 #include "llvm/Support/MathExtras.h"
 #include "llvm/Support/Process.h"
 #include "llvm/Support/raw_ostream.h"
@@ -49,6 +50,7 @@
 #include "llvm/Transforms/Utils/LowerSwitch.h"
 #include "llvm/Transforms/Utils/UnifyLoopExits.h"
 #include <array>
+#include <cstring>
 #include <functional>
 #include <map>
 #include <optional>
@@ -68,13 +70,14 @@ constexpr unsigned kStorageBufferClass = 12;
 
 using LocalSize = std::array<unsigned, 3>;
 
-/// Reads the workgroup size from `MOJO_SPIRV_LOCAL_SIZE` ("x[,y[,z]]").
-ErrorOr<LocalSize> getLocalSize() {
+/// Reads the workgroup size from `MOJO_SPIRV_LOCAL_SIZE` ("x[,y[,z]]"), and
+/// whether it is set.
+ErrorOr<std::pair<LocalSize, bool>> getLocalSize() {
   LocalSize size = {64, 1, 1};
   std::optional<std::string> env =
       sys::Process::GetEnv("MOJO_SPIRV_LOCAL_SIZE");
   if (!env)
-    return size;
+    return std::make_pair(size, false);
   SmallVector<StringRef> parts;
   StringRef(*env).split(parts, ',');
   if (parts.size() > 3)
@@ -82,7 +85,14 @@ ErrorOr<LocalSize> getLocalSize() {
   for (auto [i, part] : enumerate(parts))
     if (part.trim().getAsInteger(10, size[i]) || size[i] == 0)
       return Error("invalid MOJO_SPIRV_LOCAL_SIZE '" + Twine(*env) + "'");
-  return size;
+  return std::make_pair(size, true);
+}
+
+std::string printed(const Type &type) {
+  std::string text;
+  raw_string_ostream os(text);
+  type.print(os);
+  return text;
 }
 
 std::string printed(const Value &value) {
@@ -173,12 +183,15 @@ Type *inferElementType(Value *root) {
 class KernelRewriter {
 public:
   KernelRewriter(Module &module, Function &kernel, StringRef entryName,
-                 LocalSize localSize)
+                 LocalSize localSize, bool dynamicSize)
       : module(module), kernel(kernel), entryName(entryName),
-        localSize(localSize), dl(module.getDataLayout()),
-        ctx(module.getContext()), i32(Type::getInt32Ty(ctx)) {}
+        localSize(localSize), dynamicSize(dynamicSize),
+        dl(module.getDataLayout()), ctx(module.getContext()),
+        i32(Type::getInt32Ty(ctx)) {}
 
   ErrorOrSuccess run();
+  /// The kernel's launch description (JSON), once `run` succeeded.
+  const std::string &getDescription() const { return description; }
 
 private:
   /// Memory a pointer reaches: a storage buffer or a shared array, or a group
@@ -190,6 +203,7 @@ private:
     Type *elementType = nullptr;
     Type *storageType = nullptr;       // handle or array type
     SmallVector<unsigned, 2> choices;  // a group's roots, sorted
+    bool read = false, written = false;
   };
   /// A pointer as (root, i32 element index); a null index means element 0.
   /// Into a group, `selector` (i32) is the position of the actual root among
@@ -204,6 +218,8 @@ private:
   struct Leaf {
     Type *type;
     SmallVector<Value *> values;
+    unsigned arg = 0;     // the argument it belongs to
+    uint64_t offset = 0;  // its byte offset in the argument's value
   };
 
   ErrorOrSuccess flattenArgument(Argument &arg, SmallVectorImpl<Leaf> &leaves);
@@ -241,6 +257,12 @@ private:
   Function &kernel;
   StringRef entryName;
   LocalSize localSize;
+  /// Whether the workgroup size is the launch's block size, set at pipeline
+  /// creation (specialization constants), rather than fixed in the shader.
+  bool dynamicSize;
+  /// With a dynamic size, the launch's block size, read from the params.
+  std::array<Value *, 3> blockDims{};
+  std::string description;
   const DataLayout &dl;
   LLVMContext &ctx;
   Type *i32;
@@ -268,32 +290,41 @@ ErrorOrSuccess KernelRewriter::flattenArgument(Argument &arg,
     return flattenInMemory(arg, arg.getParamByValType(), leaves);
   Type *type = arg.getType();
   if (!type->isAggregateType()) {
-    leaves.push_back({type, {&arg}});
+    leaves.push_back({type, {&arg}, arg.getArgNo(), 0});
     return {};
   }
-  SmallVector<std::pair<SmallVector<unsigned>, Type *>> fields;
+  struct Field {
+    SmallVector<unsigned> path;
+    Type *type;
+    uint64_t offset;
+  };
+  SmallVector<Field> fields;
   SmallVector<unsigned> path;
-  std::function<void(Type *)> collect = [&](Type *field) {
+  std::function<void(Type *, uint64_t)> collect = [&](Type *field,
+                                                      uint64_t offset) {
     if (auto *structType = dyn_cast<StructType>(field)) {
+      const StructLayout *layout = dl.getStructLayout(structType);
       for (unsigned i = 0, e = structType->getNumElements(); i != e; ++i) {
         path.push_back(i);
-        collect(structType->getElementType(i));
+        collect(structType->getElementType(i),
+                offset + layout->getElementOffset(i));
         path.pop_back();
       }
     } else if (auto *arrayType = dyn_cast<ArrayType>(field)) {
+      uint64_t stride = dl.getTypeAllocSize(arrayType->getElementType());
       for (uint64_t i = 0, e = arrayType->getNumElements(); i != e; ++i) {
         path.push_back(static_cast<unsigned>(i));
-        collect(arrayType->getElementType());
+        collect(arrayType->getElementType(), offset + i * stride);
         path.pop_back();
       }
     } else {
-      fields.push_back({path, field});
+      fields.push_back({path, field, offset});
     }
   };
-  collect(type);
+  collect(type, 0);
   size_t first = leaves.size();
   for (auto &field : fields)
-    leaves.push_back({field.second, {}});
+    leaves.push_back({field.type, {}, arg.getArgNo(), field.offset});
 
   SmallVector<std::pair<Value *, SmallVector<unsigned>>> work{{&arg, {}}};
   while (!work.empty()) {
@@ -312,7 +343,7 @@ ErrorOrSuccess KernelRewriter::flattenArgument(Argument &arg,
         continue;
       }
       auto it = find_if(fields, [&](auto &field) {
-        return ArrayRef<unsigned>(field.first) == ArrayRef<unsigned>(fieldPath);
+        return ArrayRef<unsigned>(field.path) == ArrayRef<unsigned>(fieldPath);
       });
       if (it == fields.end())
         return Error("unknown field of an aggregate kernel argument: " +
@@ -348,7 +379,7 @@ ErrorOrSuccess KernelRewriter::flattenInMemory(Argument &arg, Type *type,
   collect(type, 0);
   size_t first = leaves.size();
   for (auto &field : fields)
-    leaves.push_back({field.second, {}});
+    leaves.push_back({field.second, {}, arg.getArgNo(), field.first});
 
   SmallVector<std::pair<Value *, int64_t>> work{{&arg, 0}};
   while (!work.empty()) {
@@ -781,8 +812,11 @@ ErrorOrSuccess KernelRewriter::visit(Instruction &inst) {
       if (!dim || dim->getZExtValue() > 2)
         return Error("non-constant workgroup size dimension: " +
                      printed(inst));
-      intrinsic->replaceAllUsesWith(ConstantInt::get(
-          intrinsic->getType(), localSize[dim->getZExtValue()]));
+      intrinsic->replaceAllUsesWith(
+          dynamicSize ? b.CreateZExtOrTrunc(blockDims[dim->getZExtValue()],
+                                            intrinsic->getType())
+                      : ConstantInt::get(intrinsic->getType(),
+                                         localSize[dim->getZExtValue()]));
       dead.push_back(intrinsic);
       return {};
     }
@@ -904,6 +938,8 @@ ErrorOrSuccess KernelRewriter::visit(Instruction &inst) {
 ErrorOrSuccess KernelRewriter::rewriteAccess(Instruction &inst, unsigned root,
                                              Value *index) {
   IRBuilder<> b(&inst);
+  roots[root].read |= !isa<StoreInst>(inst);
+  roots[root].written |= !isa<LoadInst>(inst);
   const Root &memory = roots[root];
   if (needsAccessByParts(accessType(inst), memory.elementType))
     return accessByParts(b, inst, memory, index);
@@ -1328,6 +1364,7 @@ ErrorOrSuccess KernelRewriter::expandMemIntrinsics() {
         memory->isVolatile())
       return unsupported();
     Address dest = destination->second;
+    roots[dest.root].written = true;
     const Root &root = roots[dest.root];
     Type *element = root.elementType;
     if (!element->isIntegerTy() && !element->isFloatingPointTy())
@@ -1340,6 +1377,7 @@ ErrorOrSuccess KernelRewriter::expandMemIntrinsics() {
           roots[it->second.root].elementType != element)
         return unsupported();
       source = it->second;
+      roots[source->root].read = true;
     } else if (!isa<MemSetInst>(memory)) {
       return unsupported();
     }
@@ -1430,8 +1468,17 @@ ErrorOrSuccess KernelRewriter::run() {
     if (ErrorOrSuccess err = flattenArgument(arg, leaves))
       return err;
   }
+  // Argument sizes, for the description.
+  json::Array argInfo;
+  for (Argument &arg : kernel.args()) {
+    Type *type = arg.hasByValAttr() ? arg.getParamByValType() : arg.getType();
+    argInfo.push_back(json::Object{
+        {"bytes", static_cast<int64_t>(dl.getTypeAllocSize(type))},
+        {"byval", arg.hasByValAttr()}});
+  }
   unsigned binding = 0;
   SmallVector<const Leaf *> scalars;
+  SmallVector<std::pair<const Leaf *, unsigned>> buffers; // leaf, root
   for (const Leaf &leaf : leaves) {
     if (!leaf.type->isPointerTy()) {
       scalars.push_back(&leaf);
@@ -1451,11 +1498,15 @@ ErrorOrSuccess KernelRewriter::run() {
     Value *handle =
         createHandle(b, handleType, binding, ("buf" + Twine(binding)).str());
     roots.push_back({handle, nullptr, elementType, handleType, {}});
+    buffers.push_back({&leaf, static_cast<unsigned>(roots.size() - 1)});
     for (Value *value : leaf.values)
       addresses[value] = {static_cast<unsigned>(roots.size() - 1), nullptr};
     ++binding;
   }
-  if (!scalars.empty()) {
+  // With a dynamic workgroup size, the block size follows the scalars.
+  std::optional<unsigned> paramsBinding;
+  if (!scalars.empty() || dynamicSize) {
+    paramsBinding = binding;
     Type *i64 = Type::getInt64Ty(ctx);
     Type *handleType = TargetExtType::get(ctx, "spirv.VulkanBuffer",
                                           {ArrayType::get(i64, 0)},
@@ -1479,6 +1530,13 @@ ErrorOrSuccess KernelRewriter::run() {
                                     ? value
                                     : b.CreateBitCast(value, use->getType()));
     }
+    if (dynamicSize)
+      for (unsigned d = 0; d != 3; ++d)
+        blockDims[d] = b.CreateTrunc(
+            b.CreateLoad(i64, getPointer(b, params,
+                                         b.getInt32(static_cast<uint32_t>(
+                                             scalars.size() + d)))),
+            i32);
   }
 
   if (ErrorOrSuccess err = addSharedRoots(*entry, b))
@@ -1501,6 +1559,7 @@ ErrorOrSuccess KernelRewriter::run() {
   for (Argument &arg : kernel.args())
     if (!arg.use_empty())
       return Error("kernel argument still in use: " + printed(arg));
+  std::string kernelName = kernel.getName().str();
   kernel.eraseFromParent();
   for (GlobalVariable *global : retypedGlobals)
     if (global->use_empty())
@@ -1512,6 +1571,49 @@ ErrorOrSuccess KernelRewriter::run() {
       return Error("kernel still calls a function (Vulkan entry points must "
                    "be fully inlined): " +
                    printed(inst));
+
+  // The launch description: where each argument's pointers and scalars go.
+  json::Array bufferInfo;
+  for (auto [i, buffer] : enumerate(buffers)) {
+    const Root &root = roots[buffer.second];
+    bufferInfo.push_back(json::Object{
+        {"binding", static_cast<int64_t>(i)},
+        {"arg", static_cast<int64_t>(buffer.first->arg)},
+        {"offset", static_cast<int64_t>(buffer.first->offset)},
+        {"element", printed(*root.elementType)},
+        {"access", root.read && root.written ? "read_write"
+                   : root.written            ? "write"
+                   : root.read               ? "read"
+                                             : "none"}});
+  }
+  json::Value paramsInfo = nullptr;
+  if (paramsBinding) {
+    json::Array slots;
+    for (const Leaf *leaf : scalars)
+      slots.push_back(json::Object{{"arg", static_cast<int64_t>(leaf->arg)},
+                                   {"offset", static_cast<int64_t>(leaf->offset)},
+                                   {"type", printed(*leaf->type)}});
+    if (dynamicSize)
+      for (const char *dim : {"block_dim.x", "block_dim.y", "block_dim.z"})
+        slots.push_back(json::Object{{"value", dim}});
+    paramsInfo = json::Object{{"binding", static_cast<int64_t>(*paramsBinding)},
+                              {"slots", std::move(slots)}};
+  }
+  json::Array size{static_cast<int64_t>(localSize[0]),
+                   static_cast<int64_t>(localSize[1]),
+                   static_cast<int64_t>(localSize[2])};
+  json::Object workgroupSize =
+      dynamicSize ? json::Object{{"default", std::move(size)},
+                                 {"spec_ids", json::Array{0, 1, 2}}}
+                  : json::Object{{"fixed", std::move(size)}};
+  raw_string_ostream os(description);
+  os << json::Value(json::Object{{"abi", "mojo-vulkan-1"},
+                                 {"entry", entryName},
+                                 {"kernel", kernelName},
+                                 {"workgroup_size", std::move(workgroupSize)},
+                                 {"args", std::move(argInfo)},
+                                 {"buffers", std::move(bufferInfo)},
+                                 {"params", std::move(paramsInfo)}});
   return {};
 }
 
@@ -1610,10 +1712,14 @@ void prepareForCodegen(Function &fn) {
 
 } // namespace
 
-ErrorOrSuccess lowerSPIRVKernelsToVulkan(Module &module) {
-  ErrorOr<LocalSize> localSize = getLocalSize();
+ErrorOrSuccess lowerSPIRVKernelsToVulkan(Module &module,
+                                         VulkanModuleInfo &info) {
+  ErrorOr<std::pair<LocalSize, bool>> localSize = getLocalSize();
   if (localSize.isError())
     return localSize.takeError();
+  // Without MOJO_SPIRV_LOCAL_SIZE, the workgroup size is each launch's block
+  // size: MAX picks it at the launch, while Vulkan fixes it per pipeline.
+  info.specializeWorkgroupSize = !localSize->second;
 
   SmallVector<Function *> kernels;
   for (Function &fn : module)
@@ -1626,7 +1732,7 @@ ErrorOrSuccess lowerSPIRVKernelsToVulkan(Module &module) {
       kernel->setName(name + ".kernel");
     // A kernel declaring its block size (MAX_THREADS_PER_BLOCK_METADATA) gets
     // it as its workgroup size; others take MOJO_SPIRV_LOCAL_SIZE.
-    LocalSize size = *localSize;
+    LocalSize size = localSize->first;
     if (Attribute attr = kernel->getFnAttribute("mojo.spirv.numthreads");
         attr.isStringAttribute()) {
       unsigned threads = 0;
@@ -1637,9 +1743,11 @@ ErrorOrSuccess lowerSPIRVKernelsToVulkan(Module &module) {
     if (ErrorOrSuccess err = inlineCalls(*kernel))
       return err;
     trapsToReturns(*kernel);
-    KernelRewriter rewriter(module, *kernel, name, size);
+    KernelRewriter rewriter(module, *kernel, name, size,
+                            info.specializeWorkgroupSize);
     if (ErrorOrSuccess err = rewriter.run())
       return err;
+    info.descriptions.push_back(rewriter.getDescription());
   }
   for (Function &fn : module)
     if (fn.hasFnAttribute("hlsl.shader"))
@@ -1658,6 +1766,118 @@ ErrorOrSuccess lowerSPIRVKernelsToVulkan(Module &module) {
     return Error("invalid module after the Vulkan kernel rewrite: " +
                  Twine(message));
   return {};
+}
+
+
+ErrorOr<std::vector<uint32_t>>
+finishVulkanSPIRV(ArrayRef<uint32_t> words, const VulkanModuleInfo &info) {
+  // SPIR-V opcodes and operands used below.
+  enum : uint32_t {
+    OpSourceContinued = 2, OpSource = 3, OpSourceExtension = 4, OpName = 5,
+    OpMemberName = 6, OpString = 7, OpExtension = 10, OpExtInstImport = 11,
+    OpMemoryModel = 14, OpEntryPoint = 15, OpExecutionMode = 16,
+    OpCapability = 17, OpTypeInt = 21, OpTypeVector = 23,
+    OpSpecConstant = 50, OpSpecConstantComposite = 51, OpFunction = 54,
+    OpDecorate = 71, OpModuleProcessed = 330, OpExecutionModeId = 331,
+    DecorationSpecId = 1, DecorationBuiltIn = 11, BuiltInWorkgroupSize = 25,
+    ExecutionModeLocalSize = 17,
+  };
+  if (words.size() < 5 || words[0] != 0x07230203)
+    return Error("not a SPIR-V module");
+  uint32_t bound = words[3];
+  // The end of the debug section (OpModuleProcessed goes last in it, and
+  // annotations follow), the first function, existing u32 and v3u32 types,
+  // and the shader's LocalSize.
+  size_t debugEnd = 0, firstFunction = 0;
+  uint32_t u32 = 0, v3u32 = 0;
+  std::array<uint32_t, 3> localSize = {1, 1, 1};
+  for (size_t at = 5; at < words.size();) {
+    uint32_t count = words[at] >> 16, opcode = words[at] & 0xffff;
+    if (count == 0 || at + count > words.size())
+      return Error("malformed SPIR-V module");
+    switch (opcode) {
+    case OpCapability: case OpExtension: case OpExtInstImport:
+    case OpMemoryModel: case OpEntryPoint: case OpExecutionModeId:
+    case OpString: case OpSourceExtension: case OpSource:
+    case OpSourceContinued: case OpName: case OpMemberName:
+    case OpModuleProcessed:
+      break;
+    case OpExecutionMode:
+      if (count == 6 && words[at + 2] == ExecutionModeLocalSize)
+        localSize = {words[at + 3], words[at + 4], words[at + 5]};
+      break;
+    default:
+      if (!debugEnd)
+        debugEnd = at;
+      if (opcode == OpTypeInt && count == 4 && words[at + 2] == 32 &&
+          words[at + 3] == 0)
+        u32 = words[at + 1];
+      if (opcode == OpTypeVector && count == 4 && u32 &&
+          words[at + 2] == u32 && words[at + 3] == 3)
+        v3u32 = words[at + 1];
+      if (opcode == OpFunction && !firstFunction)
+        firstFunction = at;
+      break;
+    }
+    at += count;
+  }
+  if (!debugEnd || !firstFunction)
+    return Error("SPIR-V module without a function");
+
+  // OpModuleProcessed "mojo.vulkan.abi <json>" per kernel: drivers ignore
+  // debug instructions, and a runtime finds each kernel's launch description
+  // inside its module.
+  std::vector<uint32_t> debug;
+  for (const std::string &description : info.descriptions) {
+    std::string text = "mojo.vulkan.abi " + description;
+    size_t stringWords = text.size() / 4 + 1;  // with the terminating zero
+    if (stringWords + 1 > 0xffff)
+      return Error("kernel description too long for SPIR-V");
+    debug.push_back(static_cast<uint32_t>((stringWords + 1) << 16 |
+                                          OpModuleProcessed));
+    size_t first = debug.size();
+    debug.resize(first + stringWords, 0);
+    std::memcpy(&debug[first], text.data(), text.size());
+  }
+
+  // The workgroup size as specialization constants 0, 1 and 2 (defaulting to
+  // the shader's LocalSize), which a WorkgroupSize built-in overrides.
+  std::vector<uint32_t> annotations, constants;
+  if (info.specializeWorkgroupSize) {
+    if (!u32) {
+      u32 = bound++;
+      constants.insert(constants.end(), {4u << 16 | OpTypeInt, u32, 32, 0});
+    }
+    if (!v3u32) {
+      v3u32 = bound++;
+      constants.insert(constants.end(), {4u << 16 | OpTypeVector, v3u32, u32, 3});
+    }
+    std::array<uint32_t, 3> ids;
+    for (unsigned d = 0; d != 3; ++d) {
+      ids[d] = bound++;
+      constants.insert(constants.end(),
+                       {4u << 16 | OpSpecConstant, u32, ids[d], localSize[d]});
+      annotations.insert(annotations.end(),
+                         {4u << 16 | OpDecorate, ids[d], DecorationSpecId, d});
+    }
+    uint32_t workgroupSize = bound++;
+    constants.insert(constants.end(),
+                     {6u << 16 | OpSpecConstantComposite, v3u32, workgroupSize,
+                      ids[0], ids[1], ids[2]});
+    annotations.insert(annotations.end(),
+                       {4u << 16 | OpDecorate, workgroupSize, DecorationBuiltIn,
+                        BuiltInWorkgroupSize});
+  }
+
+  std::vector<uint32_t> result(words.begin(), words.begin() + debugEnd);
+  result[3] = bound;
+  result.insert(result.end(), debug.begin(), debug.end());
+  result.insert(result.end(), annotations.begin(), annotations.end());
+  result.insert(result.end(), words.begin() + debugEnd,
+                words.begin() + firstFunction);
+  result.insert(result.end(), constants.begin(), constants.end());
+  result.insert(result.end(), words.begin() + firstFunction, words.end());
+  return result;
 }
 
 } // namespace M::KGEN

@@ -32,8 +32,10 @@
 #include "llvm/Target/TargetMachine.h"
 #include <algorithm>
 #include <atomic>
+#include <cstring>
 #include <optional>
 #include <string>
+#include <vector>
 
 namespace M::KGEN {
 namespace {
@@ -143,7 +145,8 @@ private:
     // the IR that LLVM's SPIR-V codegen receives.
     writeDebugFile(debugPath("MOJO_SPIRV_DUMP_IN", id, kernel, ".in.ll"),
                    [&](llvm::raw_ostream &os) { module.print(os, nullptr); });
-    if (ErrorOrSuccess err = lowerSPIRVKernelsToVulkan(module))
+    VulkanModuleInfo info;
+    if (ErrorOrSuccess err = lowerSPIRVKernelsToVulkan(module, info))
       return err.takeError();
     writeDebugFile(debugPath("MOJO_SPIRV_DUMP", id, kernel, ".ll"),
                    [&](llvm::raw_ostream &os) { module.print(os, nullptr); });
@@ -160,6 +163,17 @@ private:
       return Error(Twine(error.getError()) +
                    ", llc failed to codegen LLVM IR to SPIR-V");
     }
+    // Each kernel's launch description, and a workgroup size set per launch.
+    if (buf->getBufferSize() % 4)
+      return Error("SPIR-V module is not a whole number of words");
+    std::vector<uint32_t> words(buf->getBufferSize() / 4);
+    std::memcpy(words.data(), buf->getBufferStart(), buf->getBufferSize());
+    ErrorOr<std::vector<uint32_t>> finished = finishVulkanSPIRV(words, info);
+    if (finished.isError())
+      return finished.takeError();
+    buf = WriteableBuffer::get();
+    buf->write(reinterpret_cast<const char *>(finished->data()),
+               finished->size() * 4);
     // Debugging aid: keep every SPIR-V module, e.g. to run spirv-val on the
     // kernels of a MAX graph, which never reach the file system otherwise.
     writeDebugFile(debugPath("MOJO_SPIRV_SAVE_DIR", id, kernel, ".spv"),

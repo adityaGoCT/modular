@@ -25,7 +25,13 @@ retargeter's times, and Llama 48 of 48 tokens at 281.0 ms a token.
   test graphs give SPIR-V that passes `spirv-val` for every kernel, 211
   kernels in all: elementwise ops, cast, transpose, slice, concat, gather,
   reductions, argmax, softmax, layer_norm, three matmuls, conv2d, both pools,
-  and a full ResNet-18 (74 kernels). None of them has run on the phone yet.
+  and a full ResNet-18 (74 kernels).
+- MAX's kernels on the phone: the 43 kernels of 13 of those graphs (all
+  variants of MAX's elementwise kernel for eight ops, the f32 to f16 cast,
+  transpose, and the naive matmul at 256x256 f32 and f16 and a 1x2048x2048
+  GEMV) run on Turnip with arguments laid out from their launch descriptions
+  and match NumPy (`max_kernels/test_max_kernels.py` in mojo-adreno). The
+  other graphs' kernels have not run yet.
 
 ## How it fits together
 
@@ -64,9 +70,18 @@ A Vulkan compute shader takes no arguments, so the backend's pass
   the pieces. `ptrtoint` gives each buffer its own base, 2^40 apart, plus the
   byte offset, so alignment checks see aligned buffers. memset and memcpy on
   buffers become element loops.
-- The workgroup size is fixed in the shader: the kernel's
-  `MAX_THREADS_PER_BLOCK_METADATA`, else `MOJO_SPIRV_LOCAL_SIZE` ("x[,y[,z]]"),
-  else 64.
+- The workgroup size is each launch's block size, which MAX picks at the
+  launch while Vulkan fixes it per pipeline: specialization constants 0, 1, 2
+  (a `WorkgroupSize` built-in) set it when the runtime creates the pipeline,
+  and the kernel reads `block_dim` from the last three params slots. Setting
+  `MOJO_SPIRV_LOCAL_SIZE` ("x[,y[,z]]") instead fixes it in the shader (the
+  kernel's `MAX_THREADS_PER_BLOCK_METADATA` if it has one), as the runners in
+  mojo-adreno expect.
+- Each module carries its kernel's launch description, as
+  `OpModuleProcessed "mojo.vulkan.abi {json}"`: every argument's size, and for
+  each storage buffer and params slot the argument and byte offset it comes
+  from (and whether the kernel reads or writes the buffer), plus the
+  workgroup size. A runtime lays out a launch from it; drivers ignore it.
 
 ## Build and use
 
@@ -108,7 +123,8 @@ kernel.
 - Codegen runs at -O0 to avoid an LLVM 24 SPIR-V crash (loop strength
   reduction). A second LLVM bug, which put an OpSelectionMerge before an
   unconditional branch, is patched in this branch.
-- MAX graphs are compiled, not run: nothing checks their results yet. Loads
+- Only 13 of the 25 MAX test graphs have run on the phone, each kernel with
+  arguments filled in by a test script rather than MAX's runtime. Loads
   through a pointer into several buffers also read element 0 of the others,
   which must not be empty.
 - `barrier()` orders shared memory only; LLVM has no intrinsic for a

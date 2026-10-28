@@ -20,6 +20,11 @@
 #define KGEN_COMPILER_OBJECTCOMPILER_TARGET_SPIRV_VULKANKERNELABI_H
 
 #include "Support/ErrorOr.h"
+#include "llvm/ADT/ArrayRef.h"
+#include "llvm/ADT/SmallVector.h"
+#include <cstdint>
+#include <string>
+#include <vector>
 
 namespace llvm {
 class Module;
@@ -48,11 +53,32 @@ namespace M::KGEN {
 ///  - an access of another type than the memory's elements (a struct, a
 ///    narrower or wider scalar) reads or writes whole elements and shifts the
 ///    pieces; `ptrtoint` gives each buffer its own aligned base,
-///  - `llvm.spv.workgroup.size` folds to the workgroup size, which Vulkan fixes
-///    in the shader: `MOJO_SPIRV_LOCAL_SIZE` ("x[,y[,z]]"), 64 by default,
+///  - `llvm.spv.workgroup.size` (the block size) folds to
+///    `MOJO_SPIRV_LOCAL_SIZE` ("x[,y[,z]]") when that fixes the workgroup
+///    size, and is read from the params buffer otherwise (see below),
 ///  - multiply-high is expanded, and vectors wider than four elements, which
 ///    Vulkan cannot hold, are scalarized.
-ErrorOrSuccess lowerSPIRVKernelsToVulkan(llvm::Module &module);
+///
+/// Each kernel gets a launch description (JSON, "abi": "mojo-vulkan-1"): its
+/// arguments' sizes, and for each storage buffer and params slot the argument
+/// and byte offset it comes from. Unless `MOJO_SPIRV_LOCAL_SIZE` fixes it, the
+/// workgroup size is the launch's block size: specialization constants 0-2
+/// set it at pipeline creation, and the kernel reads it from the params
+/// buffer's last three slots.
+struct VulkanModuleInfo {
+  llvm::SmallVector<std::string, 1> descriptions;
+  bool specializeWorkgroupSize = false;
+};
+
+ErrorOrSuccess lowerSPIRVKernelsToVulkan(llvm::Module &module,
+                                         VulkanModuleInfo &info);
+
+/// Finishes the SPIR-V that LLVM emitted for `info`'s module: embeds each
+/// kernel description as an `OpModuleProcessed "mojo.vulkan.abi <json>"`, and
+/// with a dynamic workgroup size adds the specialization constants (SpecId
+/// 0, 1, 2) and the WorkgroupSize built-in that override LocalSize.
+ErrorOr<std::vector<uint32_t>>
+finishVulkanSPIRV(llvm::ArrayRef<uint32_t> words, const VulkanModuleInfo &info);
 
 } // namespace M::KGEN
 
