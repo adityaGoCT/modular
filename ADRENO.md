@@ -140,7 +140,7 @@ memory by 2 x 2 subgroups, standalone kernels reach 3.5-3.7 TFLOP/s in fp16 and
 2.5 TFLOP/s in fp32 at 2048x2048x2048 on the S26 Ultra, after three workarounds
 for fp16 in shared memory on its driver (mojo-adreno's README). A batched
 Llama 3.2 1B prefill built on the fp32 kernel reads a 431-token prompt in
-1.29 s instead of 17.3 s one token at a time.
+0.68 s instead of 17.7 s one token at a time.
 
 `CoopMatrix.zero()` comes out as an `OpConstantComposite`, as glslang writes
 it: the backend builds the matrix with `OpCompositeConstruct` (LLVM cannot
