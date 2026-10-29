@@ -130,6 +130,18 @@ phone; at that size a dispatch costs about 0.15 ms whatever it computes.
 Kernels for `adreno710` come out as before (GLSL450 memory model, no
 extensions).
 
+Cooperative matrices also load from and store to shared memory
+(`stack_allocation[..., address_space=AddressSpace.SHARED]`): `CoopMatrix`
+passes every pointer to its marker in the generic address space, one marker
+signature for all, and the pass traces the cast back to the shared array (a
+matrix at element 0 gets an explicit element pointer; IRBuilder would fold it
+into the array variable, which the instruction cannot take). Staged in shared
+memory by 2 x 2 subgroups, standalone kernels reach 3.5-3.7 TFLOP/s in fp16 and
+2.5 TFLOP/s in fp32 at 2048x2048x2048 on the S26 Ultra, after three workarounds
+for fp16 in shared memory on its driver (mojo-adreno's README). A batched
+Llama 3.2 1B prefill built on the fp32 kernel reads a 431-token prompt in
+1.29 s instead of 17.3 s one token at a time.
+
 ## How it fits together
 
 | Piece | Files |
