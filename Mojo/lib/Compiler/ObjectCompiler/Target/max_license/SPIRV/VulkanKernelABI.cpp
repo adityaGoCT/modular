@@ -1620,7 +1620,13 @@ ErrorOrSuccess KernelRewriter::lowerCooperativeMatrices() {
       const Root &root = roots[address.root];
       if (root.elementType != element)
         return nullptr;
-      return getPointer(b, root, address.index);
+      Value *pointer = getPointer(b, root, address.index);
+      // IRBuilder folds element 0 of a shared array into the array variable
+      // itself; a cooperative-matrix access needs a pointer to an element.
+      if (isa<GlobalVariable>(pointer))
+        pointer = b.Insert(GetElementPtrInst::CreateInBounds(
+            root.storageType, root.shared, {b.getInt32(0), b.getInt32(0)}));
+      return pointer;
     };
     CallInst *result = nullptr;
     if (marker == kCoopLoad || marker == kCoopZero) {
