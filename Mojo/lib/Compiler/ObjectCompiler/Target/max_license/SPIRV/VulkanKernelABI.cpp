@@ -14,6 +14,7 @@
 #include "Target/max_license/SPIRV/VulkanKernelABI.h"
 
 #include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/PostOrderIterator.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SetVector.h"
@@ -1635,6 +1636,8 @@ ErrorOrSuccess KernelRewriter::lowerCooperativeMatrices() {
         return Error("unsupported cooperative matrix: " + printed(*call));
       Type *element = type->getTypeParameter(0);
       if (marker == kCoopZero) {
+        // An OpCompositeConstruct of constants, which finishVulkanSPIRV turns
+        // into an OpConstantComposite.
         result = b.CreateCall(
             coopmatBuiltin("__spirv_CompositeConstruct", type, {element}),
             {Constant::getNullValue(element)});
@@ -2094,8 +2097,11 @@ finishVulkanSPIRV(ArrayRef<uint32_t> words, const VulkanModuleInfo &info) {
     OpMemberName = 6, OpString = 7, OpExtension = 10, OpExtInstImport = 11,
     OpMemoryModel = 14, OpEntryPoint = 15, OpExecutionMode = 16,
     OpCapability = 17, OpTypeInt = 21, OpTypeVector = 23,
-    OpSpecConstant = 50, OpSpecConstantComposite = 51, OpFunction = 54,
-    OpDecorate = 71, OpModuleProcessed = 330, OpExecutionModeId = 331,
+    OpConstantTrue = 41, OpConstantFalse = 42, OpConstant = 43,
+    OpConstantComposite = 44, OpConstantNull = 46, OpSpecConstant = 50,
+    OpSpecConstantComposite = 51, OpFunction = 54, OpDecorate = 71,
+    OpCompositeConstruct = 80, OpModuleProcessed = 330,
+    OpExecutionModeId = 331, OpTypeCooperativeMatrixKHR = 4456,
     DecorationSpecId = 1, DecorationBuiltIn = 11, BuiltInWorkgroupSize = 25,
     ExecutionModeLocalSize = 17,
   };
@@ -2107,6 +2113,7 @@ finishVulkanSPIRV(ArrayRef<uint32_t> words, const VulkanModuleInfo &info) {
   // and the shader's LocalSize.
   size_t debugEnd = 0, firstFunction = 0;
   uint32_t u32 = 0, v3u32 = 0;
+  DenseSet<uint32_t> matrixTypes, constantIds;
   std::array<uint32_t, 3> localSize = {1, 1, 1};
   for (size_t at = 5; at < words.size();) {
     uint32_t count = words[at] >> 16, opcode = words[at] & 0xffff;
@@ -2134,6 +2141,13 @@ finishVulkanSPIRV(ArrayRef<uint32_t> words, const VulkanModuleInfo &info) {
         v3u32 = words[at + 1];
       if (opcode == OpFunction && !firstFunction)
         firstFunction = at;
+      if (opcode == OpTypeCooperativeMatrixKHR && count >= 2)
+        matrixTypes.insert(words[at + 1]);
+      if (!firstFunction && count >= 3 &&
+          (opcode == OpConstantTrue || opcode == OpConstantFalse ||
+           opcode == OpConstant || opcode == OpConstantComposite ||
+           opcode == OpConstantNull))
+        constantIds.insert(words[at + 2]);
       break;
     }
     at += count;
@@ -2186,6 +2200,27 @@ finishVulkanSPIRV(ArrayRef<uint32_t> words, const VulkanModuleInfo &info) {
                         BuiltInWorkgroupSize});
   }
 
+  // A cooperative matrix built from constants (CoopMatrix.zero()) becomes an
+  // OpConstantComposite, as glslang writes it: one Adreno 840 driver build
+  // (with Android 17) fails to create any pipeline with an
+  // OpCompositeConstruct of a matrix. The two have the same operands.
+  std::vector<uint32_t> functions;
+  for (size_t at = firstFunction; at < words.size();) {
+    uint32_t count = words[at] >> 16, opcode = words[at] & 0xffff;
+    if (opcode == OpCompositeConstruct && count >= 4 &&
+        matrixTypes.contains(words[at + 1]) &&
+        llvm::all_of(words.slice(at + 3, count - 3),
+                     [&](uint32_t id) { return constantIds.contains(id); })) {
+      constants.push_back(count << 16 | OpConstantComposite);
+      constants.insert(constants.end(), words.begin() + at + 1,
+                       words.begin() + at + count);
+    } else {
+      functions.insert(functions.end(), words.begin() + at,
+                       words.begin() + at + count);
+    }
+    at += count;
+  }
+
   std::vector<uint32_t> result(words.begin(), words.begin() + debugEnd);
   result[3] = bound;
   result.insert(result.end(), debug.begin(), debug.end());
@@ -2193,7 +2228,7 @@ finishVulkanSPIRV(ArrayRef<uint32_t> words, const VulkanModuleInfo &info) {
   result.insert(result.end(), words.begin() + debugEnd,
                 words.begin() + firstFunction);
   result.insert(result.end(), constants.begin(), constants.end());
-  result.insert(result.end(), words.begin() + firstFunction, words.end());
+  result.insert(result.end(), functions.begin(), functions.end());
   return result;
 }
 
