@@ -33,6 +33,11 @@ retargeter's times, and Llama 48 of 48 tokens at 281.0 ms a token.
   GEMV) run on Turnip with arguments laid out from their launch descriptions
   and match NumPy (`max_kernels/test_max_kernels.py` in mojo-adreno). The
   other graphs' kernels have not run yet.
+- KHR cooperative matrices on an Adreno 840 (a Galaxy S26 Ultra in Samsung's
+  Remote Test Lab, stock driver), with the second target, `adreno840`: MAX's
+  cooperative-matrix matmul passes on the phone for its three test graphs, and
+  standalone Mojo kernels reach 2.1 TFLOP/s in fp16 and 1.3 TFLOP/s in fp32
+  at 2048x2048x2048 ([below](#cooperative-matrices-khr-for-adreno-8xx)).
 
 ## MAX on the phone: a remote device
 
@@ -66,20 +71,20 @@ gives the SPIR-V target a plain grid-and-block launch.
 ## Cooperative matrices (KHR) for Adreno 8xx
 
 A second target, `adreno840`, gives the same SPIR-V and also lets kernels use
-`SPV_KHR_cooperative_matrix`: 16x16 tiles that a subgroup loads, multiply-adds
-and stores together, which a driver with `VK_KHR_cooperative_matrix` maps to
-the GPU's matrix hardware. In Mojo they are
+`SPV_KHR_cooperative_matrix`: tiles that a subgroup loads, multiply-adds and
+stores together, which a driver with `VK_KHR_cooperative_matrix` maps to the
+GPU's matrix hardware. In Mojo they are
 `max.gpu.compute.arch.mma_spirv.CoopMatrix`:
 
 ```mojo
 from max.gpu.compute.arch.mma_spirv import CoopMatrix, MATRIX_A, MATRIX_B, ACCUMULATOR
 
-var acc = CoopMatrix[DType.float32, 16, 16, ACCUMULATOR].zero()
+var acc = CoopMatrix[DType.float16, 64, 64, ACCUMULATOR].zero()
 for k in range(0, K, 16):
-    var a_tile = CoopMatrix[DType.float16, 16, 16, MATRIX_A].load(a.unsafe_offset(row * K + k), K)
-    var b_tile = CoopMatrix[DType.float16, 16, 16, MATRIX_B].load(b.unsafe_offset(k * N + col), N)
+    var a_tile = CoopMatrix[DType.float16, 64, 16, MATRIX_A].load(a.unsafe_offset(row * K + k), K)
+    var b_tile = CoopMatrix[DType.float16, 16, 64, MATRIX_B].load(b.unsafe_offset(k * N + col), N)
     acc = a_tile.multiply_add(b_tile, acc)
-acc.cast[DType.float16]().store(c.unsafe_offset(row * N + col), N)
+acc.store(c.unsafe_offset(row * N + col), N)
 ```
 
 Each operation is a call to a marker function (`__mojo_spirv_coopmat_*`) that
@@ -93,21 +98,37 @@ memory model, which the extension requires. A patch to LLVM
 which LLVM had recorded for OpenCL only, and makes the two extensions available
 to Vulkan triples. Other kernels come out as before.
 
-MAX's matmul takes a cooperative-matrix kernel
-(`max/kernels/src/linalg/matmul/gpu/adreno/`) on `adreno840` when A and B are
-fp16, C is fp16 or fp32, there is no epilogue, and M, N and K are multiples of
-16 with contiguous rows: one subgroup per 16x16 tile of C, accumulating in
-fp32. Everything else takes the naive kernel.
+The shapes are the Adreno 840's. On a Galaxy S26 Ultra (Snapdragon 8 Elite
+Gen 5, stock driver 512.842.19),
+`vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR` lists subgroup-scope
+products with M = 64 and N = 16, 32 or 64 only: fp16 x fp16 -> fp16 with
+K = 16, fp32 x fp32 -> fp32 with K = 8, and 8-bit integers into 32-bit with
+K = 32. There is no fp16 x fp16 -> fp32, and the driver has no
+`VK_QCOM_cooperative_matrix_conversion`.
 
-Compile-only results, with MAX's virtual device for `vulkan:adreno840`
-(`coverage.py --arch=adreno840`): all 26 test graphs compile and all 213
-kernels pass `spirv-val` for Vulkan 1.3. Both fp16 matmul graphs, `a @ b` and
-`a @ b.T` (which the graph compiler turns into a matmul with B transposed),
-take the cooperative-matrix kernel: two `OpCooperativeMatrixLoadKHR` (B
-column-major when transposed) and an `OpCooperativeMatrixMulAddKHR` in the K
-loop, then `OpFConvert` to fp16 and `OpCooperativeMatrixStoreKHR`. Kernels for
-`adreno710` come out as before (GLSL450 memory model, no extensions), and the
-eight test kernels still pass on the phone.
+MAX's matmul takes a cooperative-matrix kernel
+(`max/kernels/src/linalg/matmul/gpu/adreno/`) on `adreno840` when A, B and C
+are all fp16 or all fp32, there is no epilogue, rows are contiguous, M and N
+are multiples of 64 and K of 16 (fp16) or 8 (fp32): one subgroup per 64x64
+tile of C, accumulating in C's type. Everything else takes the naive kernel.
+Of the 840's tile widths, 64 is the fastest: in standalone kernels on the
+phone (mojo-adreno's `coopmat/`), 2.1 TFLOP/s in fp16 and 1.3 TFLOP/s in fp32
+at 2048x2048x2048, against 0.65 and 0.37 with 16-wide tiles.
+
+Results. With MAX's virtual device for `vulkan:adreno840`
+(`coverage.py --arch=adreno840`), all 26 test graphs compile and every kernel
+passes `spirv-val` for Vulkan 1.3. The two 256x256 matmuls (fp32, fp16) and the
+fp16 `a @ b.T` (which the graph compiler turns into a matmul with B transposed,
+loaded column-major) take the cooperative-matrix kernel; the GEMV and
+ResNet-18's classifier compile it too, and fall back to the naive kernel at
+run time (one row). On the phone, mojo-adreno's `coopmat/run_coopmat.py --max`
+runs those three kernels with arguments laid out from their launch
+descriptions, and all three match NumPy: fp32 within 2.1e-5, fp16 with the
+error of fp16 accumulation. At 256x256x256 they take 0.16-0.18 ms, 183 GFLOP/s
+in fp32 and 210 in fp16, against 71 and 26 for the naive kernel on the same
+phone; at that size a dispatch costs about 0.15 ms whatever it computes.
+Kernels for `adreno710` come out as before (GLSL450 memory model, no
+extensions).
 
 ## How it fits together
 
@@ -211,13 +232,12 @@ kernel.
 - MAX itself does not run on the phone: it drives the phone remotely from the
   Mac over adb. An on-device runtime needs an Android build of MAX's runtime
   and the Vulkan plugin running locally.
-- Cooperative matrices are compile-only so far: neither of the Adreno 710's
-  drivers (Turnip, stock) exposes `VK_KHR_cooperative_matrix`, so nothing has
-  run on matrix hardware. The kernels assume 16x16x16 fp16 products with an
-  fp32 or fp16 accumulator; a driver lists the shapes it supports
-  (`vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR`, printed by
-  `coopmat/vk_coopmat_probe.c` in mojo-adreno). Integer products are not
-  lowered yet, and each subgroup computes one tile, without shared-memory
-  staging or reuse across tiles.
+- Cooperative matrices have run on one Adreno 840 (a Galaxy S26 Ultra in
+  Samsung's Remote Test Lab) with one driver version; the kernel assumes that
+  GPU's shapes (M = 64). fp16 products accumulate in fp16, the only fp16
+  accumulator the 840 offers, so long fp16 sums lose precision. Integer
+  products are not lowered yet, and each subgroup computes one tile, without
+  shared-memory staging or reuse across tiles. The Adreno 710's drivers
+  (Turnip, stock) have no `VK_KHR_cooperative_matrix`.
 - `Mojo/lib/Elaborator/Elaborator.cpp`: a second error on a node keeps the
   first instead of aborting, so failures are reported.
