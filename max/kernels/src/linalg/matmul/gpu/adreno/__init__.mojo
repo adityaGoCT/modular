@@ -14,6 +14,8 @@
 matmuls."""
 
 from .coopmat_matmul import (
+    adreno_coopmat_fits,
+    adreno_coopmat_supports,
     enqueue_adreno_coopmat_matmul,
     matmul_kernel_adreno_coopmat,
 )
