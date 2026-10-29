@@ -121,7 +121,9 @@ struct CoopMatrix[dtype: DType, rows: Int, cols: Int, use: Int](
         """
         return Self(
             handle=external_call["__mojo_spirv_coopmat_load", UInt64](
-                ptr,
+                # One marker signature for every address space; the kernel
+                # ABI pass traces the cast back to the buffer or shared array.
+                ptr.unsafe_address_space_cast[.GENERIC](),
                 Int32(stride),
                 _layout[row_major](),
                 _dtype_code[Self.dtype](),
@@ -227,7 +229,7 @@ struct CoopMatrix[dtype: DType, rows: Int, cols: Int, use: Int](
             stride: Elements between consecutive rows (or columns).
         """
         external_call["__mojo_spirv_coopmat_store", NoneType](
-            ptr,
+            ptr.unsafe_address_space_cast[.GENERIC](),
             self._handle,
             Int32(stride),
             _layout[row_major](),
