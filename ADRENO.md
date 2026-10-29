@@ -142,6 +142,13 @@ for fp16 in shared memory on its driver (mojo-adreno's README). A batched
 Llama 3.2 1B prefill built on the fp32 kernel reads a 431-token prompt in
 1.29 s instead of 17.3 s one token at a time.
 
+`CoopMatrix.zero()` comes out as an `OpConstantComposite`, as glslang writes
+it: the backend builds the matrix with `OpCompositeConstruct` (LLVM cannot
+emit a constant of the matrix type), and `finishVulkanSPIRV` turns a construct
+from constants into a constant. The Adreno 840 driver that ships with Android
+17 on the S26 Ultra reports the same version (512.842.19) as the Android 16
+one, and refused to create any pipeline with the run-time construct.
+
 ## How it fits together
 
 | Piece | Files |
