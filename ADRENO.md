@@ -4,10 +4,13 @@ This branch adds an experimental GPU target, `adreno710`, to the open-source
 Mojo compiler and MAX: Mojo kernels compile straight to Vulkan compute shaders
 (SPIR-V) for a Qualcomm Adreno 710, through LLVM's SPIR-V backend. It is a
 prototype, not a Modular product. The project around it (test kernels, the
-Vulkan runners, Llama 3.2 1B on the phone, and a 27-slide presentation) is at
+Vulkan runners, Llama 3.2 1B, Bonsai 2 2B and a ternary Qwen3-8B on the phone,
+and two presentations) is at
 [adityaGoCT/mojo-adreno](https://github.com/adityaGoCT/mojo-adreno). The
-presentation, with speaker notes, is also
-[online](https://claude.ai/artifact/9HodHBDh22HuBYoo5UxTN6).
+presentations, with speaker notes, are also online: the whole project
+([29 slides](https://claude.ai/artifact/9HodHBDh22HuBYoo5UxTN6)) and the
+Adreno 840 on Qualcomm's stock driver alone
+([13 slides](https://claude.ai/artifact/BVe8mtq41xJ3tQ7k95k44Y)).
 
 ## Results
 
@@ -36,8 +39,22 @@ retargeter's times, and Llama 48 of 48 tokens at 281.0 ms a token.
 - KHR cooperative matrices on an Adreno 840 (a Galaxy S26 Ultra in Samsung's
   Remote Test Lab, stock driver), with the second target, `adreno840`: MAX's
   cooperative-matrix matmul passes on the phone for its three test graphs, and
-  standalone Mojo kernels reach 2.1 TFLOP/s in fp16 and 1.3 TFLOP/s in fp32
-  at 2048x2048x2048 ([below](#cooperative-matrices-khr-for-adreno-8xx)).
+  standalone Mojo kernels reach 3.5-3.7 TFLOP/s in fp16 and 2.5 TFLOP/s in fp32
+  at 2048x2048x2048, staged in shared memory
+  ([below](#cooperative-matrices-khr-for-adreno-8xx)).
+- Language models on the Adreno 840 with `adreno840` and the stock driver
+  (512.842.19 on the S26 Ultra, 512.842.25 on Qualcomm's SM8850 reference
+  phone), each checked token for token against a reference (mojo-adreno):
+  - Llama 3.2 1B: 43 ms a token with fp16 weights, 13 ms with 4-bit weights;
+    a 431-token prompt in 0.63 s on cooperative matrices instead of 17.7 s.
+  - Bonsai 2 2B (ternary): the Mojo kernels of
+    [mav3ri3k/modular](https://github.com/mav3ri3k/modular)'s Android OpenCL
+    port compile unchanged with `--target-accelerator adreno840` (21 kernels,
+    `spirv-val` clean); 80 tokens/s, and a 412-token prompt in 0.87 s instead
+    of 5.2 s, with the ternary projections and attention scores on
+    cooperative matrices.
+  - Ternary Qwen3-8B (PrismML's Ternary-Bonsai-8B): the same ternary kernels
+    plus seven small ones, 25 tokens/s.
 
 ## MAX on the phone: a remote device
 
@@ -104,7 +121,12 @@ Gen 5, stock driver 512.842.19),
 products with M = 64 and N = 16, 32 or 64 only: fp16 x fp16 -> fp16 with
 K = 16, fp32 x fp32 -> fp32 with K = 8, and 8-bit integers into 32-bit with
 K = 32. There is no fp16 x fp16 -> fp32, and the driver has no
-`VK_QCOM_cooperative_matrix_conversion`.
+`VK_QCOM_cooperative_matrix_conversion`; nor does 512.842.25 on Qualcomm's
+SM8850 reference phone, which lists the same shapes. That extension (Vulkan
+1.4.342) would let fp16 products be summed in fp32 across tiles; LLVM's SPIR-V
+backend has none of its instructions yet, so mojo-adreno's `qcom/` keeps GLSL
+versions of the prompt kernels that use it, which its runners load when a
+driver offers the extension.
 
 MAX's matmul takes a cooperative-matrix kernel
 (`max/kernels/src/linalg/matmul/gpu/adreno/`) on `adreno840` when A, B and C
