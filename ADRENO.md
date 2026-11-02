@@ -85,6 +85,43 @@ its HAL overlay, so the kernel packages match the runtime's `DeviceContext`;
 `Device::API` constant still yields its `vendor:arch`; and a `spirv` HAL plugin
 gives the SPIR-V target a plain grid-and-block launch.
 
+## Mojo host code on the phone
+
+MAX's runtime now also builds for Android (`--config=android-arm64`). The
+configuration comes from the Android OpenCL port (mav3ri3k/modular, 03de9211):
+- an NDK C++ toolchain, with Bionic and libc++;
+- `//:elf` selects for what Linux and Android share;
+- the Mojo compiler built for the host when the target is the phone;
+- patches for tcmalloc, curl, xz and rules_cc;
+- a `Log.h` check that accepts libc++'s `long long` clock.
+
+This tree adds two things. NDK r30's libc++ no longer includes `<cstdlib>`
+transitively, so Android C++ compiles include it themselves. Android builds also
+get an output directory of their own (`--experimental_platform_in_output_dir`),
+apart from the host's `darwin_arm64-opt`. Pass `--symlink_prefix` as well, so
+that `bazel-bin` stays on the host build.
+
+```bash
+BAZELISK_SKIP_WRAPPER=true ./bazelw build --config=disable-lint --compilation_mode=opt \
+    --config=android-arm64 --repo_env=ANDROID_NDK_HOME=/path/to/ndk \
+    --symlink_prefix=bazel-android- //Mojo:CompilerRT
+```
+
+Mojo code that uses MAX's HAL `DeviceContext` then compiles for the phone:
+`mojo build --emit object --target-triple aarch64-unknown-linux-android33
+--target-accelerator adreno840`, with its kernels inside as SPIR-V. The triple
+needs all four parts, so that the stdlib sees `linux`. It links against
+`libKGENCompilerRTShared.so`, and its `DeviceContext` opens a Vulkan driver plugin
+on the phone (`driver/` in mojo-adreno).
+
+On a Galaxy S26 Ultra:
+- the Android port's Bonsai 2 2B `model.mojo`, with "opencl" changed to
+  "vulkan", decodes at 74–76 tok/s and matches the MLX reference token for
+  token;
+- a launch through `DeviceContext` costs 6.5 µs.
+
+mojo-adreno's `android/` builds the programs.
+
 ## Cooperative matrices (KHR) for Adreno 8xx
 
 A second target, `adreno840`, gives the same SPIR-V and also lets kernels use
