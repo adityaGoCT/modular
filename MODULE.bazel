@@ -37,3 +37,7 @@ include("//bazel/public-patches:llvm.MODULE.bazel")
 cfg_workaround = use_repo_rule("//bazel/internal:cfg_workaround.bzl", "cfg_workaround")
 
 cfg_workaround(name = "cfg_workaround.bzl")
+
+android_ndk_repository = use_repo_rule("//bazel/internal/cc-toolchain:android_ndk_repository.bzl", "android_ndk_repository")
+
+android_ndk_repository(name = "android-ndk")

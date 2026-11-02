@@ -44,3 +44,14 @@ build:public-cache --remote_cache=grpcs://modular-public.buildbuddy.io
 # Check for a local gitignored bazel config.
 # NOTE: Import this last so that local configs can override.
 try-import %workspace%/local.bazelrc
+
+# Use the SDK HAL-backed Mojo DeviceContext and its C++ compatibility shim.
+build:hal-device-context --//:hal_device_context=true
+
+# Android ARM64 runtime cross-build. Select NDK through
+# --repo_env=ANDROID_NDK_HOME=/path/to/ndk; host tools retain their host platform.
+build:android-arm64 --platforms=//:android-aarch64-platform
+build:android-arm64 --repo_env=MODULAR_TARGET=android:aarch64
+build:android-arm64 --config=hal-device-context
+# Name the output directory after the platform, apart from the host's darwin_arm64-opt.
+build:android-arm64 --experimental_platform_in_output_dir

@@ -911,6 +911,8 @@ modular_cc_library(
     # runfiles rather than becoming a NEEDED entry on everything that can
     # compile PTX.
     data = select({
+        # The bundled NVPTX compiler targets glibc, not Android's Bionic.
+        "//:android_aarch64": [],
         "@platforms//os:linux": ["//bazel/public-patches:NVPTX"],
         "//conditions:default": [],
     }),

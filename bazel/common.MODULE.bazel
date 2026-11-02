@@ -56,6 +56,7 @@ archive_override(
         # Adds `bitcode_libs` to `mojo_library` so a generated `.bc` can be embedded
         # in a package; `--bitcode-libs` in copts breaks under path mapping.
         "//bazel/public-patches:rules_mojo_bitcode_libs.patch",
+        "//bazel/public-patches:rules_mojo-optional-python.patch",
     ],
     strip_prefix = "rules_mojo-47643a3b441c20c3a351b8807e37c547338557c8",
     urls = [
@@ -1071,6 +1072,8 @@ single_version_override(
         "//bazel/public-patches:tcmalloc-local-dynamic.patch",
         "//bazel/public-patches:tcmalloc-numa.patch",
         "//bazel/public-patches:tcmalloc-glibc-rseq.patch",
+        "//bazel/public-patches:tcmalloc-android-address-bits.patch",
+        "//bazel/public-patches:tcmalloc-android-no-rseq.patch",
     ],
 )
 
@@ -1392,3 +1395,23 @@ LOGIT_VERIFICATION_GOLDENS = [
 ]
 
 # END GENERATED LOGIT_VERIFICATION GOLDEN HTTP_FILES
+
+# Use the compiler driver to select the platform's pthread implementation.
+single_version_override(
+    module_name = "curl",
+    patch_strip = 1,
+    patches = ["//bazel/public-patches:curl-pthread.patch"],
+)
+
+single_version_override(
+    module_name = "rules_cc",
+    patch_strip = 1,
+    patches = ["//bazel/public-patches:rules_cc-android-soname.patch"],
+)
+
+# Bionic has no libintl; the bundled Android preset incorrectly enables NLS.
+single_version_override(
+    module_name = "xz",
+    patch_strip = 1,
+    patches = ["//bazel/public-patches:xz-android-gettext.patch"],
+)
