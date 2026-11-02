@@ -24,6 +24,8 @@ from std.testing import TestSuite
 def test_os_query() raises:
     assert_false(CompilationTarget.is_macos())
     assert_true(CompilationTarget.is_linux())
+    # glibc Linux: Android is Linux too, but its triple's environment names it.
+    assert_false(CompilationTarget.is_android())
 
     # The supported Linux targets, x86-64 and aarch64, are both little endian.
     assert_equal(Endian.native(), Endian.little)

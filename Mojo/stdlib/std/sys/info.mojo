@@ -906,6 +906,19 @@ struct CompilationTarget[_mlir_value: _TargetType = _current_target(), //](
         return Self._os() == "linux"
 
     @staticmethod
+    def is_android() -> Bool:
+        """Returns True if the target operating system is Android.
+
+        Android is Linux with its own C library, Bionic: `is_linux()` is also
+        True for it. The target triple's environment names it, as in
+        `aarch64-unknown-linux-android33`.
+
+        Returns:
+            True if the target operating system is Android and False otherwise.
+        """
+        return Self.is_linux() and "android" in StaticString(Self.__triple())
+
+    @staticmethod
     def is_macos() -> Bool:
         """Returns True if the host operating system is macOS.
 

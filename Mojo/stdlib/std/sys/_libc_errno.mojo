@@ -16,7 +16,9 @@ from std.sys.info import CompilationTarget, platform_map
 
 
 def _errno_ptr(out result: Pointer[c_int, MutUntrackedOrigin]):
-    comptime if CompilationTarget.is_linux():
+    comptime if CompilationTarget.is_android():
+        result = external_call["__errno", type_of(result)]()
+    elif CompilationTarget.is_linux():
         result = external_call["__errno_location", type_of(result)]()
     elif CompilationTarget.is_macos():
         result = external_call["__error", type_of(result)]()
@@ -29,7 +31,8 @@ def get_errno() -> ErrNo:
 
     This function retrieves the thread-local errno value set by the last
     failed system call. The implementation is platform-specific, using
-    `__errno_location()` on Linux and `__error()` on macOS.
+    `__errno_location()` on Linux, `__errno()` on Android and `__error()` on
+    macOS.
 
     Returns:
         The current errno value as an ErrNo struct.

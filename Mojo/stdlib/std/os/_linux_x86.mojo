@@ -13,6 +13,7 @@
 
 from std.collections import Array
 from std.ffi import external_call
+from std.sys.info import CompilationTarget
 from std.time.time import _CTimeSpec
 
 from .fstat import stat_result
@@ -106,9 +107,17 @@ struct _c_stat(Copyable, Defaultable, Writable):
 @inline(.always)
 def _stat(var path: String) raises -> _c_stat:
     var stat = _c_stat()
-    var err = external_call["__xstat", Int32](
-        Int32(0), path.as_c_string_span(), Pointer(to=stat)
-    )
+    # glibc before 2.33 exports stat only as `__xstat`; Android's Bionic has
+    # no `__xstat`, only `stat`.
+    var err: Int32
+    comptime if CompilationTarget.is_android():
+        err = external_call["stat", Int32](
+            path.as_c_string_span(), Pointer(to=stat)
+        )
+    else:
+        err = external_call["__xstat", Int32](
+            Int32(0), path.as_c_string_span(), Pointer(to=stat)
+        )
     if err == -1:
         raise Error("unable to stat '", path, "'")
     return stat^
@@ -117,9 +126,15 @@ def _stat(var path: String) raises -> _c_stat:
 @inline(.always)
 def _lstat(var path: String) raises -> _c_stat:
     var stat = _c_stat()
-    var err = external_call["__lxstat", Int32](
-        Int32(0), path.as_c_string_span(), Pointer(to=stat)
-    )
+    var err: Int32
+    comptime if CompilationTarget.is_android():
+        err = external_call["lstat", Int32](
+            path.as_c_string_span(), Pointer(to=stat)
+        )
+    else:
+        err = external_call["__lxstat", Int32](
+            Int32(0), path.as_c_string_span(), Pointer(to=stat)
+        )
     if err == -1:
         raise Error("unable to lstat '", path, "'")
     return stat^

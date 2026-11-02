@@ -25,6 +25,7 @@ from std.testing import TestSuite
 def test_os_query() raises:
     assert_true(CompilationTarget.is_macos())
     assert_false(CompilationTarget.is_linux())
+    assert_false(CompilationTarget.is_android())
 
     # The mac systems are either arm64 or intel, so they are always little
     # endian at the moment.
