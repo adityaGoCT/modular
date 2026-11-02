@@ -114,13 +114,26 @@ needs all four parts, so that the stdlib sees `linux`. It links against
 `libKGENCompilerRTShared.so`, and its `DeviceContext` opens a Vulkan driver plugin
 on the phone (`driver/` in mojo-adreno).
 
-On a Galaxy S26 Ultra:
-- the Android port's Bonsai 2 2B `model.mojo`, with "opencl" changed to
-  "vulkan", decodes at 74–76 tok/s and matches the MLX reference token for
-  token;
-- a launch through `DeviceContext` costs 6.5 µs.
+On a Galaxy S26 Ultra, every model's forward pass also runs as Mojo
+`DeviceContext` code, with no C runner. Every token matches the reference:
 
-mojo-adreno's `android/` builds the programs.
+| Model | Mojo `DeviceContext` | C runner | Reference |
+|---|---|---|---|
+| Llama 3.2 1B, fp16 | 24.7 tok/s | 23 tok/s | PyTorch |
+| Llama 3.2 1B, 4-bit | 78.1 tok/s | 75 tok/s | PyTorch |
+| Ternary Qwen3-8B | 25.1 tok/s | 25 tok/s | MLX |
+| Bonsai 2 2B, the Android port's own `model.mojo` | 74–76 tok/s | 80 tok/s | MLX |
+
+The Bonsai row uses the port's `model.mojo` with "opencl" changed to
+"vulkan".
+
+A launch through `DeviceContext` costs 6.5 µs. The phone downloads each
+checkpoint from Hugging Face and converts it to a byte-identical copy of the
+Mac's export.
+
+Mojo's stdlib takes the Android target as Linux and calls `__errno_location`,
+`__xstat` and `__lxstat`, which Bionic does not have; the programs link a small
+shim for now. mojo-adreno's `android/` builds the programs.
 
 ## Cooperative matrices (KHR) for Adreno 8xx
 
