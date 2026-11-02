@@ -131,9 +131,10 @@ A launch through `DeviceContext` costs 6.5 µs. The phone downloads each
 checkpoint from Hugging Face and converts it to a byte-identical copy of the
 Mac's export.
 
-Mojo's stdlib takes the Android target as Linux and calls `__errno_location`,
-`__xstat` and `__lxstat`, which Bionic does not have; the programs link a small
-shim for now. mojo-adreno's `android/` builds the programs.
+The stdlib knows the target is Android (`CompilationTarget.is_android()`, from the
+triple's environment). There it calls Bionic's `__errno`, `stat` and `lstat`,
+not glibc's `__errno_location`, `__xstat` and `__lxstat`. mojo-adreno's
+`android/` builds the programs.
 
 ## Cooperative matrices (KHR) for Adreno 8xx
 
