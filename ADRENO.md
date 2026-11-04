@@ -8,9 +8,9 @@ Vulkan runners, Llama 3.2 1B, Bonsai 2 2B and a ternary Qwen3-8B on the phone,
 and two presentations) is at
 [adityaGoCT/mojo-adreno](https://github.com/adityaGoCT/mojo-adreno). The
 presentations, with speaker notes, are also online: the whole project
-([29 slides](https://claude.ai/artifact/9HodHBDh22HuBYoo5UxTN6)) and the
+([30 slides](https://claude.ai/artifact/9HodHBDh22HuBYoo5UxTN6)) and the
 Adreno 840 on Qualcomm's stock driver alone
-([13 slides](https://claude.ai/artifact/BVe8mtq41xJ3tQ7k95k44Y)).
+([14 slides](https://claude.ai/artifact/BVe8mtq41xJ3tQ7k95k44Y)).
 
 ## Results
 
