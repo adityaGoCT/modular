@@ -172,8 +172,23 @@ Type *accessType(const Instruction &inst) {
 /// aggregate access. A byte type (from byte-offset GEPs and memcpy-like
 /// accesses, or bools) loses to any other; float if the memory is never
 /// accessed.
-Type *inferElementType(Value *root) {
-  Type *found = nullptr, *byte = nullptr;
+///
+/// With `widenForCoopmat` (shared arrays): memory that cooperative matrices
+/// of a component narrower than 32 bits read or write, that plain stores
+/// write, and that every plain load and store accesses in whole groups of 4
+/// (or else 2) components, takes vectors of that many components as elements
+/// (`<4 x half>`, GLSL's f16vec4, for an fp16 tile written 8 or 16 bytes at a
+/// time). Each store then writes whole vectors instead of splitting into
+/// single 16-bit elements (8 stores for 16 bytes of halves), and the matrix
+/// accesses read the array with offsets and strides counted in vectors. An
+/// array of 32-bit integers would not do: from one, the Adreno 840's driver
+/// counts a matrix load's stride in halves instead of array elements.
+Type *inferElementType(Value *root, bool widenForCoopmat = false) {
+  Type *found = nullptr, *byte = nullptr, *plain = nullptr, *coop = nullptr;
+  // The size in bits of each plain load, store or atomic (0 for an
+  // aggregate), and whether any plain access writes.
+  SmallVector<uint64_t> accessBits;
+  bool written = false;
   SmallVector<Value *> work{root};
   SmallPtrSet<Value *, 16> seen;
   while (!work.empty()) {
@@ -182,6 +197,7 @@ Type *inferElementType(Value *root) {
       continue;
     for (User *user : value->users()) {
       Type *type = nullptr;
+      bool isCoop = false;
       if (auto *load = dyn_cast<LoadInst>(user))
         type = load->getType();
       else if (auto *store = dyn_cast<StoreInst>(user);
@@ -200,11 +216,18 @@ Type *inferElementType(Value *root) {
         type =
             code ? coopmatElementType(value->getContext(), code->getZExtValue())
                  : nullptr;
+        isCoop = true;
       } else if (isa<GetElementPtrInst, AddrSpaceCastInst, BitCastInst, PHINode,
                      SelectInst>(user))
         work.push_back(user);
       if (!type)
         continue;
+      if (!isCoop) {
+        bool scalarOrVector = !type->isAggregateType() && !type->isPointerTy();
+        uint64_t bits = type->getPrimitiveSizeInBits().getFixedValue();
+        accessBits.push_back(scalarOrVector ? bits : 0);
+        written |= !isa<LoadInst>(user);
+      }
       for (;;) {
         if (auto *aggregate = dyn_cast<StructType>(type);
             aggregate && aggregate->getNumElements())
@@ -219,10 +242,23 @@ Type *inferElementType(Value *root) {
         continue;
       if (type->isIntegerTy(1))
         type = Type::getInt8Ty(type->getContext());
-      if (type->isIntegerTy(8))
+      if (type->isIntegerTy(8)) {
         byte = type;
-      else if (!found)
+        continue;
+      }
+      if (!found)
         found = type;
+      (isCoop ? coop : plain) = type;
+    }
+  }
+  if (widenForCoopmat && coop && plain && written) {
+    uint64_t coopBits = coop->getPrimitiveSizeInBits().getFixedValue();
+    for (unsigned lanes : {4u, 2u}) {
+      uint64_t group = lanes * coopBits;
+      if (coopBits && coopBits < 32 && group % 32 == 0 &&
+          all_of(accessBits,
+                 [&](uint64_t bits) { return bits && bits % group == 0; }))
+        return FixedVectorType::get(coop, lanes);
     }
   }
   if (found)
@@ -282,6 +318,8 @@ private:
   Value *createHandle(IRBuilder<> &b, Type *handleType, unsigned binding,
                       StringRef name);
   Value *getPointer(IRBuilder<> &b, const Root &root, Value *index);
+  Value *sharedElement(IRBuilder<> &b, const Root &root, Value *index);
+  static bool inBoundsShared(const Root &root);
   ErrorOrSuccess addSharedRoots(Function &entry, IRBuilder<> &b);
   ErrorOr<Value *> elementIndex(IRBuilder<> &b, GetElementPtrInst &gep,
                                 Type *elementType);
@@ -301,6 +339,8 @@ private:
   bool needsAccessByParts(Type *type, Type *elementType);
   ErrorOrSuccess accessByParts(IRBuilder<> &b, Instruction &inst,
                                const Root &root, Value *index);
+  ErrorOrSuccess accessWholeVectors(IRBuilder<> &b, Instruction &inst,
+                                    const Root &root, Value *index);
   ErrorOrSuccess finishPhis();
   ErrorOrSuccess expandGroupAccesses();
   ErrorOrSuccess expandMemIntrinsics();
@@ -493,13 +533,31 @@ Value *KernelRewriter::createHandle(IRBuilder<> &b, Type *handleType,
                            b.getInt32(0), nameVar});
 }
 
+/// Whether element pointers into `root`, a shared array, are inbounds GEPs
+/// (OpInBoundsAccessChain): for elements of 32-bit or wider components only.
+/// The Adreno 840's driver (512.842.19) addresses an OpInBoundsAccessChain
+/// into a shared array of 16-bit components (half, <2 x half>, <4 x half>) as
+/// if each element took twice its size, while its OpAccessChain, and its
+/// cooperative matrices, pack them; on 32-bit arrays its OpAccessChain is
+/// slower (lk.gemm_q4, fp32 tiles in shared memory: 13-17%).
+bool KernelRewriter::inBoundsShared(const Root &root) {
+  return root.elementType->getScalarSizeInBits() >= 32;
+}
+
+Value *KernelRewriter::sharedElement(IRBuilder<> &b, const Root &root,
+                                     Value *index) {
+  if (inBoundsShared(root))
+    return b.CreateInBoundsGEP(root.storageType, root.shared,
+                               {b.getInt32(0), index});
+  return b.CreateGEP(root.storageType, root.shared, {b.getInt32(0), index});
+}
+
 Value *KernelRewriter::getPointer(IRBuilder<> &b, const Root &root,
                                   Value *index) {
   if (!index)
     index = b.getInt32(0);
   if (root.shared)
-    return b.CreateInBoundsGEP(root.storageType, root.shared,
-                               {b.getInt32(0), index});
+    return sharedElement(b, root, index);
   Function *fn = Intrinsic::getOrInsertDeclaration(
       &module, Intrinsic::spv_resource_getpointer,
       {PointerType::get(ctx, kStorageBufferAS), root.storageType, i32});
@@ -523,7 +581,7 @@ ErrorOrSuccess KernelRewriter::addSharedRoots(Function &entry,
       elementType = array->getElementType();
       count = array->getNumElements();
     }
-    Type *accessed = inferElementType(global);
+    Type *accessed = inferElementType(global, /*widenForCoopmat=*/true);
     if (elementType->isAggregateType() || elementType != accessed) {
       // A byte array (or a nested aggregate) accessed as another type is
       // retyped to an array of that type over the same bytes.
@@ -1016,6 +1074,8 @@ ErrorOrSuccess KernelRewriter::rewriteAccess(Instruction &inst, unsigned root,
   roots[root].read |= !isa<StoreInst>(inst);
   roots[root].written |= !isa<LoadInst>(inst);
   const Root &memory = roots[root];
+  if (memory.elementType->isVectorTy())
+    return accessWholeVectors(b, inst, memory, index);
   if (needsAccessByParts(accessType(inst), memory.elementType))
     return accessByParts(b, inst, memory, index);
   if (splitVectorAccess(b, inst, memory, index))
@@ -1225,6 +1285,82 @@ ErrorOrSuccess KernelRewriter::accessByParts(IRBuilder<> &b, Instruction &inst,
   for (auto &[i, bits] : slots)
     b.CreateStore(b.CreateBitCast(bits, element), pointerTo(i));
   dead.push_back(store);
+  return {};
+}
+
+/// Loads or stores whole elements of a shared array of vectors (one widened
+/// for cooperative matrices, of <4 x half> or <2 x half>): the value, a whole
+/// number of elements, travels as 32-bit words, and each element as a bitcast
+/// vector of them, so that no access splits an element and no 64-bit integer
+/// appears (the Adreno 840 has no 64-bit ALU).
+ErrorOrSuccess KernelRewriter::accessWholeVectors(IRBuilder<> &b,
+                                                  Instruction &inst,
+                                                  const Root &root,
+                                                  Value *index) {
+  Type *element = root.elementType;
+  Type *type = accessType(inst);
+  uint64_t elementBits = dl.getTypeSizeInBits(element).getFixedValue();
+  bool scalarOrVector =
+      !type->isAggregateType() && !type->getScalarType()->isPointerTy();
+  uint64_t bits =
+      scalarOrVector ? dl.getTypeSizeInBits(type).getFixedValue() : 0;
+  auto *load = dyn_cast<LoadInst>(&inst);
+  auto *store = dyn_cast<StoreInst>(&inst);
+  if ((!load || !load->isSimple()) && (!store || !store->isSimple()))
+    return Error("unsupported access to a shared array of vectors (one that "
+                 "cooperative matrices read): " +
+                 printed(inst));
+  if (!bits || bits % elementBits || elementBits % 32 ||
+      bits != dl.getTypeStoreSizeInBits(type).getFixedValue())
+    return Error("unsupported access to a shared array of vectors (one that "
+                 "cooperative matrices read): access whole groups of " +
+                 Twine(elementBits / 8) + " bytes: " + printed(inst));
+  unsigned count = static_cast<unsigned>(bits / elementBits);
+  unsigned words = static_cast<unsigned>(elementBits / 32);
+  unsigned total = count * words;
+  auto vectorOf = [&](unsigned n) -> Type * {
+    return n == 1 ? static_cast<Type *>(i32) : FixedVectorType::get(i32, n);
+  };
+  auto pointerTo = [&](unsigned i) {
+    Value *at = b.getInt32(i);
+    if (index)
+      at = i ? b.CreateAdd(index, at) : index;
+    return getPointer(b, root, at);
+  };
+  if (store) {
+    Value *all = b.CreateBitCast(store->getValueOperand(), vectorOf(total));
+    for (unsigned i = 0; i != count; ++i) {
+      Value *piece = all;
+      if (count != 1) {
+        if (words == 1) {
+          piece = b.CreateExtractElement(all, b.getInt32(i));
+        } else {
+          SmallVector<int> lanes;
+          for (unsigned w = 0; w != words; ++w)
+            lanes.push_back(static_cast<int>(i * words + w));
+          piece = b.CreateShuffleVector(all, lanes);
+        }
+      }
+      b.CreateStore(b.CreateBitCast(piece, element), pointerTo(i));
+    }
+  } else {
+    Value *all = PoisonValue::get(vectorOf(total));
+    for (unsigned i = 0; i != count; ++i) {
+      Value *piece =
+          b.CreateBitCast(b.CreateLoad(element, pointerTo(i)), vectorOf(words));
+      if (count == 1) {
+        all = piece;
+        break;
+      }
+      for (unsigned w = 0; w != words; ++w)
+        all = b.CreateInsertElement(
+            all,
+            words == 1 ? piece : b.CreateExtractElement(piece, b.getInt32(w)),
+            b.getInt32(i * words + w));
+    }
+    load->replaceAllUsesWith(b.CreateBitCast(all, type));
+  }
+  dead.push_back(&inst);
   return {};
 }
 
@@ -1616,17 +1752,41 @@ ErrorOrSuccess KernelRewriter::lowerCooperativeMatrices() {
   for (CallInst *call : coopmatCalls) {
     IRBuilder<> b(call);
     StringRef marker = coopmatMarker(call);
-    auto memory = [&](Type *element) -> Value * {
+    // The pointer for a matrix of `element` components, and `stride` (in
+    // components) in the memory's elements. A shared array widened for
+    // cooperative matrices has vectors of the component as elements
+    // (inferElementType): the pointer and the stride then count vectors, so
+    // the matrix must start at one and its rows (or columns) must lie a
+    // whole number of them apart.
+    auto memory = [&](Type *element, Value *&stride) -> Value * {
       const Address &address = coopmatAddresses[call];
       const Root &root = roots[address.root];
-      if (root.elementType != element)
-        return nullptr;
+      if (root.elementType != element) {
+        auto *vector = dyn_cast<FixedVectorType>(root.elementType);
+        if (!vector || vector->getElementType() != element)
+          return nullptr;
+        uint64_t ratio = vector->getNumElements();
+        if (auto *constant = dyn_cast<ConstantInt>(stride)) {
+          if (constant->getZExtValue() % ratio)
+            return nullptr;
+          stride = b.getInt32(
+              static_cast<uint32_t>(constant->getZExtValue() / ratio));
+        } else {
+          stride = isPowerOf2_64(ratio)
+                       ? b.CreateLShr(stride, Log2_64(ratio), "", true)
+                       : b.CreateExactUDiv(stride, b.getInt32(
+                                                       static_cast<uint32_t>(
+                                                           ratio)));
+        }
+      }
       Value *pointer = getPointer(b, root, address.index);
       // IRBuilder folds element 0 of a shared array into the array variable
       // itself; a cooperative-matrix access needs a pointer to an element.
       if (isa<GlobalVariable>(pointer))
-        pointer = b.Insert(GetElementPtrInst::CreateInBounds(
+        pointer = b.Insert(GetElementPtrInst::Create(
             root.storageType, root.shared, {b.getInt32(0), b.getInt32(0)}));
+      if (auto *gep = dyn_cast<GetElementPtrInst>(pointer))
+        gep->setIsInBounds(inBoundsShared(root));
       return pointer;
     };
     CallInst *result = nullptr;
@@ -1642,16 +1802,16 @@ ErrorOrSuccess KernelRewriter::lowerCooperativeMatrices() {
             coopmatBuiltin("__spirv_CompositeConstruct", type, {element}),
             {Constant::getNullValue(element)});
       } else {
-        Value *pointer = memory(element);
+        // (pointer, layout, stride): the marker passes (pointer, stride,
+        // layout).
+        Value *layout = b.CreateZExtOrTrunc(call->getArgOperand(2), i32);
+        Value *stride = b.CreateZExtOrTrunc(call->getArgOperand(1), i32);
+        Value *pointer = memory(element, stride);
         if (!pointer)
           return Error("cooperative matrix load from memory of another "
                        "element type: " +
                        printed(*call));
         roots[coopmatAddresses[call].root].read = true;
-        // (pointer, layout, stride): the marker passes (pointer, stride,
-        // layout).
-        Value *layout = b.CreateZExtOrTrunc(call->getArgOperand(2), i32);
-        Value *stride = b.CreateZExtOrTrunc(call->getArgOperand(1), i32);
         result =
             b.CreateCall(coopmatBuiltin("__spirv_CooperativeMatrixLoadKHR",
                                         type, {pointer->getType(), i32, i32}),
@@ -1693,14 +1853,14 @@ ErrorOrSuccess KernelRewriter::lowerCooperativeMatrices() {
       if (!matrix)
         return Error("store of an unknown cooperative matrix: " +
                      printed(*call));
-      Value *pointer =
-          memory(cast<TargetExtType>(matrix->getType())->getTypeParameter(0));
+      Value *stride = b.CreateZExtOrTrunc(call->getArgOperand(2), i32);
+      Value *pointer = memory(
+          cast<TargetExtType>(matrix->getType())->getTypeParameter(0), stride);
       if (!pointer)
         return Error("cooperative matrix store to memory of another element "
                      "type: " +
                      printed(*call));
       roots[coopmatAddresses[call].root].written = true;
-      Value *stride = b.CreateZExtOrTrunc(call->getArgOperand(2), i32);
       Value *layout = b.CreateZExtOrTrunc(call->getArgOperand(3), i32);
       b.CreateCall(
            coopmatBuiltin("__spirv_CooperativeMatrixStoreKHR",
@@ -2005,7 +2165,8 @@ void prepareForCodegen(Function &fn) {
   builder.registerLoopAnalyses(loops);
   builder.crossRegisterProxies(loops, functions, sccs, modules);
   FunctionPassManager passes;
-  if (hasWideVectors(fn)) {
+  bool scalarize = hasWideVectors(fn);
+  if (scalarize) {
     ScalarizerPassOptions options;
     options.ScalarizeLoadStore = true;
     passes.addPass(ScalarizerPass(options));
@@ -2014,7 +2175,64 @@ void prepareForCodegen(Function &fn) {
   passes.addPass(UnifyLoopExitsPass());
   passes.addPass(FixIrreduciblePass());
   passes.addPass(StructurizeCFGPass());
+
+  // The remaining vector loads and stores of buffers and shared memory access
+  // whole elements of a shared array widened for cooperative matrices (of
+  // <4 x half> or <2 x half>): the Scalarizer would split them into accesses
+  // of single halves, through GEPs that logical addressing cannot express.
+  // They pass it as marker calls, which it leaves whole.
+  Module &module = *fn.getParent();
+  DenseMap<Function *, std::pair<Type *, bool>> markers; // vector, is store
+  if (scalarize) {
+    SmallVector<Instruction *> accesses;
+    for (Instruction &inst : instructions(fn)) {
+      Type *type = accessType(inst);
+      unsigned at = pointerOperandIndex(inst);
+      if (!isa<LoadInst, StoreInst>(inst) || !isa<FixedVectorType>(type) ||
+          cast<FixedVectorType>(type)->getNumElements() > 4)
+        continue;
+      unsigned space = inst.getOperand(at)->getType()->getPointerAddressSpace();
+      if (space == kWorkgroupAS || space == kStorageBufferAS)
+        accesses.push_back(&inst);
+    }
+    for (Instruction *inst : accesses) {
+      IRBuilder<> b(inst);
+      bool isStore = isa<StoreInst>(inst);
+      Type *vector = accessType(*inst);
+      Value *pointer = inst->getOperand(pointerOperandIndex(*inst));
+      FunctionType *type =
+          isStore ? FunctionType::get(b.getVoidTy(),
+                                      {pointer->getType(), vector}, false)
+                  : FunctionType::get(vector, {pointer->getType()}, false);
+      std::string name;
+      raw_string_ostream os(name);
+      os << (isStore ? "__mojo_spirv_vector_store."
+                     : "__mojo_spirv_vector_load.")
+         << pointer->getType()->getPointerAddressSpace() << "." << *vector;
+      Function *marker = cast<Function>(
+          module.getOrInsertFunction(os.str(), type).getCallee());
+      markers[marker] = {vector, isStore};
+      if (isStore)
+        b.CreateCall(marker, {pointer, inst->getOperand(0)});
+      else
+        inst->replaceAllUsesWith(b.CreateCall(marker, {pointer}));
+      inst->eraseFromParent();
+    }
+  }
   passes.run(fn, functions);
+  for (auto &[marker, kind] : markers) {
+    auto [vector, isStore] = kind;
+    for (User *user : make_early_inc_range(marker->users())) {
+      auto *call = cast<CallInst>(user);
+      IRBuilder<> b(call);
+      if (isStore)
+        b.CreateStore(call->getArgOperand(1), call->getArgOperand(0));
+      else
+        call->replaceAllUsesWith(b.CreateLoad(vector, call->getArgOperand(0)));
+      call->eraseFromParent();
+    }
+    marker->eraseFromParent();
+  }
 }
 
 } // namespace
