@@ -150,6 +150,38 @@ struct CoopMatrix[dtype: DType, rows: Int, cols: Int, use: Int](
             )
         )
 
+    @staticmethod
+    @inline(.always)
+    def construct(values: SIMD[Self.dtype, 16]) -> Self:
+        """Builds the matrix from this thread's elements, without memory.
+
+        Which elements a thread holds is the driver's choice: on the Adreno
+        850 (64-wide subgroups), lane n of a 16 x 64 `MATRIX_B` matrix holds
+        column n, element k its row k. Every thread of the subgroup must call
+        it, each holding 16 elements (rows x cols / 64).
+
+        Args:
+            values: This thread's 16 elements, in the driver's order.
+
+        Returns:
+            The matrix.
+        """
+        comptime assert (
+            Self.rows * Self.cols == 16 * 64
+        ), "construct: 16 elements a thread of a 64-wide subgroup"
+        return Self(
+            handle=external_call["__mojo_spirv_coopmat_construct", UInt64](
+                values[0], values[1], values[2], values[3],
+                values[4], values[5], values[6], values[7],
+                values[8], values[9], values[10], values[11],
+                values[12], values[13], values[14], values[15],
+                _dtype_code[Self.dtype](),
+                Int32(Self.rows),
+                Int32(Self.cols),
+                Int32(Self.use),
+            )
+        )
+
     @inline(.always)
     def multiply_add[
         b_dtype: DType,

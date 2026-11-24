@@ -93,11 +93,15 @@ ErrorOr<std::pair<LocalSize, bool>> getLocalSize() {
 // as an i64 handle; dtype codes are 0 f16, 1 f32, 2 bf16, 3 i8, 4 i32.
 //   load(ptr, i32 stride, i32 layout, i32 dtype, i32 rows, i32 cols, i32 use)
 //   zero(i32 dtype, i32 rows, i32 cols, i32 use)
+//   construct(e0, .., e(n-1), i32 dtype, i32 rows, i32 cols, i32 use)
+//                                       this invocation's n components, in
+//                                       the driver's order
 //   mma(i64 a, i64 b, i64 c)            c + a x b
 //   convert(i64 matrix, i32 dtype)      to another float element type
 //   store(ptr, i64 matrix, i32 stride, i32 layout, i32 dtype)
 constexpr StringLiteral kCoopLoad = "__mojo_spirv_coopmat_load";
 constexpr StringLiteral kCoopZero = "__mojo_spirv_coopmat_zero";
+constexpr StringLiteral kCoopConstruct = "__mojo_spirv_coopmat_construct";
 constexpr StringLiteral kCoopMma = "__mojo_spirv_coopmat_mma";
 constexpr StringLiteral kCoopConvert = "__mojo_spirv_coopmat_convert";
 constexpr StringLiteral kCoopStore = "__mojo_spirv_coopmat_store";
@@ -1711,8 +1715,11 @@ ErrorOrSuccess KernelRewriter::lowerCooperativeMatrices() {
     Type *type = nullptr;
     StringRef marker = coopmatMarker(value);
     auto *call = dyn_cast<CallInst>(value);
-    if (marker == kCoopLoad || marker == kCoopZero) {
-      unsigned at = marker == kCoopLoad ? 3 : 0;
+    if (marker == kCoopLoad || marker == kCoopZero ||
+        marker == kCoopConstruct) {
+      unsigned at = marker == kCoopLoad   ? 3
+                    : marker == kCoopZero ? 0
+                                          : call->arg_size() - 4;
       Type *element = coopmatElementType(ctx, constantArg(call, at));
       uint64_t rows = constantArg(call, at + 1),
                cols = constantArg(call, at + 2),
@@ -1790,7 +1797,27 @@ ErrorOrSuccess KernelRewriter::lowerCooperativeMatrices() {
       return pointer;
     };
     CallInst *result = nullptr;
-    if (marker == kCoopLoad || marker == kCoopZero) {
+    if (marker == kCoopConstruct) {
+      // An OpCompositeConstruct of this invocation's components, which
+      // finishVulkanSPIRV splits into a splat and OpCompositeInserts (a
+      // cooperative matrix may be constructed from one constituent only).
+      auto *type = cast_or_null<TargetExtType>(typeOf(call));
+      if (!type)
+        return Error("unsupported cooperative matrix: " + printed(*call));
+      Type *element = type->getTypeParameter(0);
+      SmallVector<Value *> parts;
+      for (unsigned i = 0, e = call->arg_size() - 4; i != e; ++i) {
+        Value *v = call->getArgOperand(i);
+        if (v->getType() != element)
+          return Error("cooperative matrix construct from components of "
+                       "another type: " +
+                       printed(*call));
+        parts.push_back(v);
+      }
+      SmallVector<Type *> params(parts.size(), element);
+      result = b.CreateCall(
+          coopmatBuiltin("__spirv_CompositeConstruct", type, params), parts);
+    } else if (marker == kCoopLoad || marker == kCoopZero) {
       auto *type = cast_or_null<TargetExtType>(typeOf(call));
       if (!type)
         return Error("unsupported cooperative matrix: " + printed(*call));
@@ -2318,7 +2345,9 @@ finishVulkanSPIRV(ArrayRef<uint32_t> words, const VulkanModuleInfo &info) {
     OpConstantTrue = 41, OpConstantFalse = 42, OpConstant = 43,
     OpConstantComposite = 44, OpConstantNull = 46, OpSpecConstant = 50,
     OpSpecConstantComposite = 51, OpFunction = 54, OpDecorate = 71,
-    OpCompositeConstruct = 80, OpModuleProcessed = 330,
+    OpCompositeConstruct = 80, OpModuleProcessed = 330, OpTypePointer = 32,
+    OpFunctionEnd = 56, OpVariable = 59, OpLoad = 61, OpStore = 62,
+    OpAccessChain = 65, OpLabel = 248, StorageClassFunction = 7,
     OpExecutionModeId = 331, OpTypeCooperativeMatrixKHR = 4456,
     DecorationSpecId = 1, DecorationBuiltIn = 11, BuiltInWorkgroupSize = 25,
     ExecutionModeLocalSize = 17,
@@ -2332,6 +2361,7 @@ finishVulkanSPIRV(ArrayRef<uint32_t> words, const VulkanModuleInfo &info) {
   size_t debugEnd = 0, firstFunction = 0;
   uint32_t u32 = 0, v3u32 = 0;
   DenseSet<uint32_t> matrixTypes, constantIds;
+  DenseMap<uint32_t, uint32_t> matrixComponent;  // matrix type -> component
   std::array<uint32_t, 3> localSize = {1, 1, 1};
   for (size_t at = 5; at < words.size();) {
     uint32_t count = words[at] >> 16, opcode = words[at] & 0xffff;
@@ -2359,8 +2389,10 @@ finishVulkanSPIRV(ArrayRef<uint32_t> words, const VulkanModuleInfo &info) {
         v3u32 = words[at + 1];
       if (opcode == OpFunction && !firstFunction)
         firstFunction = at;
-      if (opcode == OpTypeCooperativeMatrixKHR && count >= 2)
+      if (opcode == OpTypeCooperativeMatrixKHR && count >= 3) {
         matrixTypes.insert(words[at + 1]);
+        matrixComponent[words[at + 1]] = words[at + 2];
+      }
       if (!firstFunction && count >= 3 &&
           (opcode == OpConstantTrue || opcode == OpConstantFalse ||
            opcode == OpConstant || opcode == OpConstantComposite ||
@@ -2422,10 +2454,84 @@ finishVulkanSPIRV(ArrayRef<uint32_t> words, const VulkanModuleInfo &info) {
   // OpConstantComposite, as glslang writes it: one Adreno 840 driver build
   // (with Android 17) fails to create any pipeline with an
   // OpCompositeConstruct of a matrix. The two have the same operands.
+  //
+  // A matrix constructed from several components (CoopMatrix.construct: this
+  // invocation's elements) is written as glslang writes `m[i] = x`: a
+  // Function variable of the matrix type, stored whole, then an OpAccessChain
+  // and OpStore an element, then loaded (the Adreno 850 compiler crashes on
+  // OpCompositeInsert into a matrix). The whole store is a splat of component
+  // 4 (a matrix may be constructed from one constituent only), which is not
+  // written again: the 850 driver (E17.52.10.04) drops a store to element 4 of
+  // a B matrix at a constant index.
   std::vector<uint32_t> functions;
+  DenseMap<uint32_t, uint32_t> functionPointer, indexConstant;
+  auto pointerTo = [&](uint32_t pointee) {
+    auto [it, fresh] = functionPointer.try_emplace(pointee, 0);
+    if (fresh) {
+      it->second = bound++;
+      constants.insert(constants.end(), {4u << 16 | OpTypePointer, it->second,
+                                         StorageClassFunction, pointee});
+    }
+    return it->second;
+  };
+  auto indexOf = [&](uint32_t i) {
+    if (!u32) {
+      u32 = bound++;
+      constants.insert(constants.end(), {4u << 16 | OpTypeInt, u32, 32, 0});
+    }
+    auto [it, fresh] = indexConstant.try_emplace(i, 0);
+    if (fresh) {
+      it->second = bound++;
+      constants.insert(constants.end(),
+                       {4u << 16 | OpConstant, u32, it->second, i});
+    }
+    return it->second;
+  };
+  DenseMap<uint32_t, uint32_t> variables;  // this function's, by matrix type
+  size_t firstBlock = 0;                    // after its first OpLabel
+  bool inFunction = false;
   for (size_t at = firstFunction; at < words.size();) {
     uint32_t count = words[at] >> 16, opcode = words[at] & 0xffff;
-    if (opcode == OpCompositeConstruct && count >= 4 &&
+    if (opcode == OpFunction) {
+      inFunction = true, firstBlock = 0;
+      variables.clear();
+    } else if (opcode == OpFunctionEnd && !variables.empty()) {
+      std::vector<uint32_t> declarations;
+      for (auto [type, variable] : variables)
+        declarations.insert(declarations.end(),
+                            {4u << 16 | OpVariable, pointerTo(type), variable,
+                             StorageClassFunction});
+      functions.insert(functions.begin() + firstBlock, declarations.begin(),
+                       declarations.end());
+    }
+    if (opcode == OpCompositeConstruct && count > 4 &&
+        matrixTypes.contains(words[at + 1]) &&
+        !llvm::all_of(words.slice(at + 3, count - 3),
+                      [&](uint32_t id) { return constantIds.contains(id); })) {
+      uint32_t type = words[at + 1], result = words[at + 2];
+      uint32_t n = count - 3, first = n > 4 ? 4 : 0;
+      auto [it, fresh] = variables.try_emplace(type, 0);
+      if (fresh)
+        it->second = bound++;
+      uint32_t variable = it->second;
+      uint32_t whole = bound++;
+      functions.insert(functions.end(), {4u << 16 | OpCompositeConstruct, type,
+                                         whole, words[at + 3 + first]});
+      functions.insert(functions.end(), {3u << 16 | OpStore, variable, whole});
+      uint32_t elementPointer = pointerTo(matrixComponent.lookup(type));
+      for (uint32_t i = 0; i != n; ++i) {
+        if (i == first)
+          continue;
+        uint32_t element = bound++;
+        functions.insert(functions.end(), {5u << 16 | OpAccessChain,
+                                           elementPointer, element, variable,
+                                           indexOf(i)});
+        functions.insert(functions.end(),
+                         {3u << 16 | OpStore, element, words[at + 3 + i]});
+      }
+      functions.insert(functions.end(),
+                       {4u << 16 | OpLoad, type, result, variable});
+    } else if (opcode == OpCompositeConstruct && count >= 4 &&
         matrixTypes.contains(words[at + 1]) &&
         llvm::all_of(words.slice(at + 3, count - 3),
                      [&](uint32_t id) { return constantIds.contains(id); })) {
@@ -2435,6 +2541,20 @@ finishVulkanSPIRV(ArrayRef<uint32_t> words, const VulkanModuleInfo &info) {
     } else {
       functions.insert(functions.end(), words.begin() + at,
                        words.begin() + at + count);
+      if (opcode == OpLabel && inFunction && !firstBlock) {
+        firstBlock = functions.size();
+        // Function variables already there stay first.
+        size_t next = at + count;
+        while (next < words.size() && (words[next] & 0xffff) == OpVariable) {
+          uint32_t c = words[next] >> 16;
+          functions.insert(functions.end(), words.begin() + next,
+                           words.begin() + next + c);
+          next += c;
+        }
+        firstBlock = functions.size();
+        at = next;
+        continue;
+      }
     }
     at += count;
   }
